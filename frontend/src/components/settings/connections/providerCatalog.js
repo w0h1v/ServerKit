@@ -107,6 +107,11 @@ export const CONNECTION_PROVIDERS = [
     {
         id: 'smtp', category: 'email', name: 'SMTP relay', kind: 'email',
         blurb: 'Send outbound mail through a provider like Postmark, SES or Mailgun.',
+        // /api/v1/email/* is served by the Email extension, not core. Without this
+        // gate the card looked available on every panel and Save/Test/Disable
+        // answered with a raw "Request failed (405)" — the SPA catch-all replying
+        // to a route that does not exist — with nothing pointing at the real cause.
+        requiresExtension: 'serverkit-email',
     },
 
     // ── Chat & webhooks ──

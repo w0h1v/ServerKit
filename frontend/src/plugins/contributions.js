@@ -18,7 +18,7 @@
  * of the plugin system, not new here. Contribution metadata is dynamic
  * though, so toggling plugins on/off updates the UI without a rebuild.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import api from '../services/api';
 import pluginsManifest from './plugins-manifest.json';
 import { loadRuntimeFrontends, getRuntimeModule } from './runtime/loader';
@@ -245,4 +245,36 @@ export function useContributions() {
     }, []);
 
     return value;
+}
+
+/**
+ * Is the extension `slug` present on this panel?
+ *
+ * Core UI sometimes fronts an API that an extension owns (a Connections card for
+ * /api/v1/email/*, a server-detail tab for /api/v1/tunnels/*). Gating those on
+ * anything other than the extension itself — an agent capability, a settings flag
+ * — leaves the control visible on a panel where its route does not exist, and the
+ * operator gets a bare "Request failed (405)" from the SPA catch-all with nothing
+ * naming the real cause. Gate on this instead.
+ *
+ * Returns TRUE until contributions have loaded (`__ready`), so a control never
+ * flickers away and back on first paint. Callers that must not act on a
+ * false-positive should check `ready` as well.
+ */
+export function useHasPlugin(slug) {
+    const contributions = useContributions();
+
+    return useMemo(() => {
+        if (!contributions.__ready) return true;
+        if (!slug) return false;
+        for (const bucket of [
+            contributions.routes, contributions.nav, contributions.tabs,
+            contributions.widgets, contributions.command_palette, contributions.layouts,
+        ]) {
+            for (const item of bucket || []) {
+                if (item && item.plugin === slug) return true;
+            }
+        }
+        return Object.prototype.hasOwnProperty.call(contributions.frontends || {}, slug);
+    }, [contributions, slug]);
 }

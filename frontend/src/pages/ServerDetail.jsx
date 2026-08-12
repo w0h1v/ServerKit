@@ -24,12 +24,14 @@ import {
 } from '../components/serverdetail/serverDetailShared';
 import ProxyStackPanel from '../components/proxy/ProxyStackPanel';
 import RemoteAccess from '../pages/RemoteAccess';
+import { useHasPlugin } from '../plugins/contributions';
 import EmptyState from '../components/EmptyState';
 
 const ServerDetail = () => {
     const { id, tab } = useParams();
     const navigate = useNavigate();
     const { confirm } = useConfirm();
+    const hasRemoteAccessExtension = useHasPlugin('serverkit-remote-access');
     const [server, setServer] = useState(null);
     const [metrics, setMetrics] = useState(null);
     const [systemInfo, setSystemInfo] = useState(null);
@@ -230,7 +232,14 @@ const ServerDetail = () => {
         ...(totalAlertCount > 0
             ? [{ id: 'alerts', label: 'Alerts', badge: totalAlertCount }]
             : [{ id: 'alerts', label: 'Alerts' }]),
-        ...(server.capabilities?.wireguard ? [{ id: 'remote-access', label: 'Remote Access' }] : []),
+        // The agent advertising wireguard is necessary but NOT sufficient: the tab
+        // renders RemoteAccess, whose whole API (/api/v1/tunnels/*) is served by
+        // the Remote Access extension. Gated on the capability alone, a panel
+        // without that extension showed the tab on every wireguard-capable agent
+        // and greeted the operator with a red "Not found" toast plus a wizard whose
+        // Save can never enable, with nothing naming the missing extension.
+        ...(server.capabilities?.wireguard && hasRemoteAccessExtension
+            ? [{ id: 'remote-access', label: 'Remote Access' }] : []),
         { id: 'settings', label: 'Settings' }
     ];
 
@@ -370,7 +379,15 @@ const ServerDetail = () => {
                         />
                     </TabsContent>
                     <TabsContent value="remote-access">
-                        <RemoteAccess serverId={id} />
+                        {hasRemoteAccessExtension ? (
+                            <RemoteAccess serverId={id} />
+                        ) : (
+                            <EmptyState
+                                title="Remote Access extension not installed"
+                                description="Exposing a local service over WireGuard is provided by the Remote Access extension. Install it from Extensions to use this tab."
+                                action={<Button onClick={() => navigate('/extensions')}>Open Extensions</Button>}
+                            />
+                        )}
                     </TabsContent>
                     <TabsContent value="settings">
                         <ServerSettingsTab

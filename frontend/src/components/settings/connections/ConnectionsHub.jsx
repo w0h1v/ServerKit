@@ -15,6 +15,7 @@ import api from '../../../services/api';
 import useSettingFocus from '../../../hooks/useSettingFocus';
 import { useAuth } from '../../../contexts/AuthContext';
 import { useToast } from '../../../contexts/ToastContext';
+import { useHasPlugin } from '../../../plugins/contributions';
 import {
     CONNECTION_CATEGORIES, CONNECTION_PROVIDERS, deriveScope, dedupeScopes,
 } from './providerCatalog';
@@ -40,6 +41,14 @@ export default function ConnectionsHub() {
     const register = useSettingFocus();
     const { isAdmin } = useAuth();
     const toast = useToast();
+    // A catalog entry whose API lives in an extension (`requiresExtension`) is
+    // hidden until that extension is installed — otherwise the card looks
+    // available and its Save lands on a route that does not exist.
+    const hasEmailExtension = useHasPlugin('serverkit-email');
+    const isProviderAvailable = useCallback((provider) => {
+        if (provider.requiresExtension === 'serverkit-email') return hasEmailExtension;
+        return !provider.requiresExtension;
+    }, [hasEmailExtension]);
 
     const [sourceStatus, setSourceStatus] = useState({ github: null, gitlab: null, bitbucket: null });
     const [sourceConfig, setSourceConfig] = useState({ github: null, gitlab: null, bitbucket: null });
@@ -485,7 +494,9 @@ export default function ConnectionsHub() {
                 <div className="connections-hub__loading">Loading connections…</div>
             ) : (
                 CONNECTION_CATEGORIES.map((cat) => {
-                    const providers = CONNECTION_PROVIDERS.filter((p) => p.category === cat.key);
+                    const providers = CONNECTION_PROVIDERS
+                        .filter((p) => p.category === cat.key)
+                        .filter(isProviderAvailable);
                     if (!providers.length) return null;
                     const focusId = CATEGORY_FOCUS_ID[cat.key];
                     return (
