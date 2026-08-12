@@ -374,6 +374,22 @@ def create_app(config_name=None):
     from app.api.servers import servers_bp
     app.register_blueprint(servers_bp, url_prefix='/api/v1/servers')
 
+    # Compat alias: the native Go agent (ServerKit-Agent, separate repo) posts its
+    # update check to /api/servers/agent/version/check — WITHOUT the /v1 — so every
+    # fielded agent gets a 405 and silently never learns an update exists. The agent
+    # ships as a compiled binary we cannot retroactively fix, and its other calls
+    # (e.g. /api/v1/servers/register) use the correct prefix, so this is a
+    # single-path defect on the agent side. Alias the same unauthenticated view at
+    # the legacy path to restore update checks for agents already deployed; the
+    # correct prefix stays the only documented one.
+    from app.api.servers import check_agent_version
+    app.add_url_rule(
+        '/api/servers/agent/version/check',
+        endpoint='agent_version_check_legacy_prefix',
+        view_func=check_agent_version,
+        methods=['POST'],
+    )
+
     # Register blueprints - Server Survey (read-only "flights" over a paired agent)
     from app.api.survey import survey_bp
     app.register_blueprint(survey_bp, url_prefix='/api/v1/servers')
