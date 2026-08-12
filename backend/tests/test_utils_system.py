@@ -66,10 +66,34 @@ class TestRunPrivileged:
     def test_skips_sudo_when_root(self, _euid, mock_run):
         mock_run.return_value = subprocess.CompletedProcess([], 0)
         run_privileged(['systemctl', 'restart', 'nginx'])
-        mock_run.assert_called_once_with(
-            ['systemctl', 'restart', 'nginx'],
-            capture_output=True, text=True, timeout=_module.DEFAULT_PRIVILEGED_TIMEOUT,
-        )
+        argv = mock_run.call_args.args[0]
+        # No sudo when we are already root...
+        assert 'sudo' not in argv
+        # ...but argv[0] is resolved to an absolute path rather than left bare.
+        # A systemd unit's PATH may omit sbin, and execing a bare name through it
+        # raised FileNotFoundError for iptables/ufw/nft even though the binaries
+        # were installed (the metadata-guard rule then silently never installed).
+        assert argv[0].startswith('/') and argv[0].endswith('/systemctl')
+        assert argv[1:] == ['restart', 'nginx']
+        assert mock_run.call_args.kwargs == {
+            'capture_output': True, 'text': True,
+            'timeout': _module.DEFAULT_PRIVILEGED_TIMEOUT,
+        }
+
+    @patch('app.utils.system.subprocess.run')
+    @patch('app.utils.system.os.geteuid', return_value=0, create=True)
+    def test_root_keeps_bare_name_when_unresolvable(self, _euid, mock_run):
+        """An unknown command stays bare so the caller sees the usual error."""
+        mock_run.return_value = subprocess.CompletedProcess([], 0)
+        run_privileged(['definitely-not-a-real-binary-xyz', '--help'])
+        assert mock_run.call_args.args[0][0] == 'definitely-not-a-real-binary-xyz'
+
+    @patch('app.utils.system.subprocess.run')
+    @patch('app.utils.system.os.geteuid', return_value=0, create=True)
+    def test_root_leaves_absolute_path_untouched(self, _euid, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0)
+        run_privileged(['/usr/bin/env', 'true'])
+        assert mock_run.call_args.args[0] == ['/usr/bin/env', 'true']
 
     @patch('app.utils.system.subprocess.run')
     @patch('app.utils.system.os.geteuid', return_value=1000, create=True)

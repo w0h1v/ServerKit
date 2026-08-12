@@ -33,6 +33,14 @@ def create_app(config_name=None):
     if config_name is None:
         config_name = os.environ.get('FLASK_ENV', 'development')
 
+    # A systemd unit inherits only the PATH its Environment= line sets, and ours
+    # ships without sbin — so privileged tools (iptables, nft, ufw) were not
+    # findable by name even running as root. run_privileged() now resolves argv[0]
+    # absolutely; this covers what that cannot reach (shell-string commands and
+    # direct subprocess callers). Idempotent, and a no-op where sbin is on PATH.
+    from app.utils.system import ensure_sbin_on_path
+    ensure_sbin_on_path()
+
     # Configure Flask to serve static files from frontend dist
     app = Flask(
         __name__,

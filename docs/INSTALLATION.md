@@ -341,7 +341,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/ServerKit/backend
-Environment="PATH=/opt/ServerKit/venv/bin"
+Environment="PATH=/opt/ServerKit/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="FLASK_ENV=production"
 ExecStart=/opt/ServerKit/venv/bin/gunicorn \
     --workers 1 \

@@ -27,6 +27,51 @@ def _needs_sudo() -> bool:
     return True
 
 
+# Directories holding privileged tools (iptables, nft, ufw, systemctl on some
+# distros). A login shell has these on PATH for root, but a systemd unit gets
+# only the PATH its Environment= line specifies — and ours ships without them.
+SBIN_DIRS = ('/usr/local/sbin', '/usr/sbin', '/sbin')
+
+
+def resolve_command(cmd: str) -> Optional[str]:
+    """Return the absolute path to *cmd*, searching sbin dirs beyond ``$PATH``.
+
+    ``shutil.which`` only looks at ``$PATH``. Under systemd our PATH has no sbin
+    entry, so bare-name lookups for iptables/nft/ufw fail even though the binary
+    is installed — see :func:`privileged_cmd` for why that mattered.
+    """
+    found = shutil.which(cmd)
+    if found:
+        return found
+
+    # Deliberately os.path.exists and NOT os.access(X_OK): when the panel runs
+    # unprivileged, a root-only-executable tool (750 root:root) is still usable
+    # through sudo, so an executable-bit check here would report it missing and
+    # hide a working feature.
+    for directory in ('/usr/bin', '/bin') + SBIN_DIRS:
+        candidate = os.path.join(directory, cmd)
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def ensure_sbin_on_path() -> str:
+    """Append the sbin dirs to this process's ``$PATH`` (idempotent).
+
+    Complements :func:`resolve_command` for the paths it cannot reach: commands
+    passed as shell STRINGS (where the shell does its own PATH lookup) and any
+    code calling ``subprocess`` directly. Call once during app startup.
+    Returns the resulting PATH.
+    """
+    current = os.environ.get('PATH', '')
+    parts = current.split(os.pathsep) if current else []
+    added = [d for d in SBIN_DIRS if d not in parts and os.path.isdir(d)]
+    if added:
+        os.environ['PATH'] = os.pathsep.join(parts + added)
+    return os.environ.get('PATH', '')
+
+
 def privileged_cmd(cmd: Union[List[str], str], *, user: Optional[str] = None) -> Union[List[str], str]:
     """Return *cmd* with ``sudo`` prepended when necessary.
 
@@ -51,9 +96,23 @@ def privileged_cmd(cmd: Union[List[str], str], *, user: Optional[str] = None) ->
 
     cmd = list(cmd)
     if _needs_sudo() and cmd[0] != 'sudo':
+        # sudo resolves through its own secure_path, which includes sbin.
         if user:
             return ['sudo', '-n', '-u', user] + cmd
         return ['sudo', '-n'] + cmd
+
+    # Already root (or no sudo): we exec directly, so argv[0] is resolved against
+    # this process's PATH. Under systemd that PATH has no sbin entry, so a bare
+    # 'iptables'/'ufw'/'nft' raised FileNotFoundError even though the binary was
+    # installed — the metadata-guard DROP rule silently never installed and the
+    # firewall reported itself absent. Resolve to an absolute path so the unit's
+    # PATH stops deciding whether privileged tooling works. If resolution fails
+    # we pass the bare name through unchanged, so the caller still sees the same
+    # error rather than a different one.
+    if cmd and cmd[0] != 'sudo' and '/' not in cmd[0]:
+        resolved = resolve_command(cmd[0])
+        if resolved:
+            cmd[0] = resolved
     return cmd
 
 
@@ -111,17 +170,12 @@ def run_command(cmd: Union[List[str], str], *, timeout: int = 60,
 def is_command_available(cmd: str) -> bool:
     """Check whether *cmd* is available on the system.
 
-    Uses ``shutil.which`` first, then falls back to checking common sbin/local
-    paths that may not be on the current ``$PATH``.
+    Shares :func:`resolve_command`'s lookup so "is it available?" and "what do we
+    exec?" can never disagree. They used to: this probe checked sbin while
+    run_privileged() execed the bare name through a sbin-less PATH, so detection
+    reported a tool present that then failed to launch.
     """
-    if shutil.which(cmd):
-        return True
-
-    for directory in ('/usr/bin', '/usr/sbin', '/usr/local/bin', '/usr/local/sbin'):
-        if os.path.exists(os.path.join(directory, cmd)):
-            return True
-
-    return False
+    return resolve_command(cmd) is not None
 
 
 def sourced_result(lines: list, source: str, source_label: str) -> dict:
