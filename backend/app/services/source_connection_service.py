@@ -87,6 +87,43 @@ class SourceConnectionService:
     # that we store locally. No shared secret, no infra on our side.
     # ==================================================================
 
+    @staticmethod
+    def _manifest_url_blocker(base_url):
+        """Why GitHub will refuse to build an App for *base_url*, or None.
+
+        Deliberately a heuristic on the client side of the failure: GitHub does
+        the real validation, but it does it AFTER redirecting the operator away,
+        so anything we can name here saves a dead-end round trip. Returns a short
+        reason phrase, or None when the URL looks acceptable.
+        """
+        import ipaddress
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or '').lower()
+        if not host:
+            return 'it is not a valid URL'
+
+        if parsed.scheme != 'https':
+            return 'GitHub requires an https:// URL for a GitHub App'
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return 'it is a private IP address GitHub cannot reach'
+            return 'GitHub needs a hostname, not a bare IP address'
+
+        # Names that exist only on a LAN, a tailnet, or a dev machine.
+        if host == 'localhost' or host.endswith(('.local', '.internal', '.lan',
+                                                '.home', '.ts.net', '.localhost')):
+            return f'"{host}" only resolves on your own network'
+        if '.' not in host:
+            return f'"{host}" is not a public domain name'
+        return None
+
     @classmethod
     def build_github_app_manifest(cls, redirect_uri, base_url):
         """Return ``(manifest, state, post_url)`` for the GitHub App manifest flow.
@@ -98,6 +135,22 @@ class SourceConnectionService:
         """
         if not redirect_uri or not base_url:
             raise ValueError('redirect_uri and base_url are required')
+
+        # GitHub creates the App from this manifest on its own servers, so it will
+        # only accept a URL reachable from the public internet over HTTPS. A panel
+        # on a private IP, a plain-HTTP origin or a tailnet/.local hostname fails
+        # ON GITHUB — the operator is bounced to github.com, sees an error there,
+        # and is never redirected back, so the panel records nothing and the whole
+        # attempt leaves no trace. Refuse up front with the working alternative.
+        blocker = cls._manifest_url_blocker(base_url)
+        if blocker:
+            raise ValueError(
+                f'GitHub cannot create an App for {base_url}: {blocker}. '
+                'Create a classic OAuth App instead at '
+                'https://github.com/settings/developers and paste its Client ID '
+                'and Secret here — that flow only needs YOUR browser to reach the '
+                'callback, so a private or plain-HTTP panel works.'
+            )
 
         base_url = base_url.rstrip('/')
         state = secrets.token_urlsafe(32)

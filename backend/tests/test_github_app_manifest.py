@@ -128,3 +128,52 @@ def test_list_repositories_app_mode_uses_installations(app, monkeypatch):
         repos = SC.list_github_repositories(user_id=1)
         names = [r['full_name'] for r in repos]
         assert names == ['me/beta', 'me/alpha']  # sorted by updated_at desc
+
+
+# --------------------------------------------------------------------------- #
+# Reachability guard. GitHub builds the App on its own servers, so a manifest for
+# a panel it cannot reach fails ON GITHUB: the operator is redirected to
+# github.com, sees the error there, and is never sent back — so /app-manifest
+# returns 200, no /complete call ever arrives, and the panel stores nothing. The
+# whole attempt leaves no trace anywhere in the panel. Refuse up front instead,
+# and name the flow that does work on a private host.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize('base_url,fragment', [
+    ('http://100.73.44.92:5100', 'https'),                 # plain HTTP
+    ('http://panel.example.com', 'https'),
+    ('https://192.168.1.5', 'private IP'),
+    ('https://10.0.0.9:5100', 'private IP'),
+    ('https://127.0.0.1:5100', 'private IP'),
+    ('https://8.8.8.8', 'hostname, not a bare IP'),
+    ('https://build.llama-panga.ts.net:5100', 'own network'),
+    ('https://panel.local', 'own network'),
+    ('https://myhost', 'not a public domain'),
+    ('nonsense', 'not a valid URL'),
+])
+def test_unreachable_base_urls_are_refused(app, base_url, fragment):
+    with app.test_request_context():
+        with pytest.raises(ValueError) as exc:
+            SC.build_github_app_manifest(f'{base_url}/connections/github-app/callback',
+                                         base_url)
+        message = str(exc.value)
+        assert fragment in message
+        # The refusal must carry the alternative, or it is just a dead end with
+        # better wording.
+        assert 'OAuth App' in message
+        assert 'github.com/settings/developers' in message
+
+
+@pytest.mark.parametrize('base_url', [
+    'https://panel.example.com',
+    'https://serverkit.example.co.uk:8443',
+])
+def test_public_https_urls_are_allowed(app, base_url):
+    with app.test_request_context():
+        manifest, _state, _post = SC.build_github_app_manifest(
+            f'{base_url}/connections/github-app/callback', base_url)
+        assert manifest['url'] == base_url
+
+
+def test_blocker_helper_returns_none_for_public_https():
+    assert SC._manifest_url_blocker('https://panel.example.com') is None
