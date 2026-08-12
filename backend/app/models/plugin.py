@@ -113,6 +113,11 @@ class InstalledPlugin(db.Model):
             # predate stamping, else {status: verified|untrusted_key|unsigned,
             # key_id?, publisher?}. Panel-managed (reserved config key).
             'signature': (self.config or {}).get('_signature'),
+            # Set when the extension's blueprint could not hot-load into the
+            # already-running app (Flask forbids register_blueprint after the
+            # first request), so its API stays unmounted until the panel
+            # restarts. Panel-managed reserved config key; cleared at boot.
+            'restart_required': bool((self.config or {}).get('_restart_required')),
             'installed_at': self.installed_at.isoformat() if self.installed_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

@@ -976,6 +976,14 @@ const PluginRow = ({ plugin, update, busy, onToggle, onUpdate, onUninstall, onCo
                         <Badge variant={sourceBadge.variant} title={sourceBadge.title}>{sourceBadge.label}</Badge>
                         {plugin.has_backend && <Badge variant="secondary">Backend</Badge>}
                         {plugin.has_frontend && <Badge variant="secondary">Frontend</Badge>}
+                        {plugin.restart_required && (
+                            <Badge
+                                variant="warning"
+                                title="This extension's API is not mounted yet — restart the panel to activate it"
+                            >
+                                Restart required
+                            </Badge>
+                        )}
                         {updateAvailable && (
                             <Badge variant="info" className="plugin-update-badge">
                                 Update available → v{update.available_version}
@@ -984,6 +992,12 @@ const PluginRow = ({ plugin, update, busy, onToggle, onUpdate, onUninstall, onCo
                     </div>
                     {plugin.description && <p className="installed-item__description">{plugin.description}</p>}
                     {plugin.error_message && <p className="installed-item__error">{plugin.error_message}</p>}
+                    {plugin.restart_required && (
+                        <p className="installed-item__notice">
+                            Installed, but its backend routes are not served yet. Restart the panel
+                            to activate them — until then this extension&apos;s API returns 404.
+                        </p>
+                    )}
                 </div>
             </div>
             <div className="installed-item__actions">

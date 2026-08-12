@@ -330,7 +330,8 @@
     }
 
     .installed-item__description,
-    .installed-item__error {
+    .installed-item__error,
+    .installed-item__notice {
         margin: $space-1 0 0;
         color: $text-secondary;
         font-size: $font-size-sm;
@@ -339,6 +340,12 @@
 
     .installed-item__error {
         color: $danger;
+    }
+
+    // Pending-restart hint: the extension installed fine, so this is an action
+    // the operator still has to take — not an error.
+    .installed-item__notice {
+        color: $warning;
     }
 
     .installed-item--error {

@@ -238,3 +238,66 @@ def test_uninstall_keep_data_leaves_tables(app, injected_plugin, tmp_path, monke
 
     plugin_service.uninstall_plugin(p.id, purge=False)
     assert 'ext_testext_thing' in inspect(db.engine).get_table_names()
+
+
+# --------------------------------------------------------------------------- #
+# Pending-restart flag — Flask refuses register_blueprint once the app has
+# served a request, so an extension installed on a RUNNING panel gets an
+# 'active' row with no mounted routes. The flag makes that visible instead of
+# leaving every call to its API 404ing with only a log line to explain it.
+# --------------------------------------------------------------------------- #
+
+def test_restart_required_flag_round_trip(app):
+    p = _plugin_row({})
+    assert p.to_dict()['restart_required'] is False
+
+    plugin_service._set_restart_required(p, True, reason='needs a restart')
+    assert p.config['_restart_required'] == {'reason': 'needs a restart'}
+    assert p.to_dict()['restart_required'] is True
+
+    plugin_service._set_restart_required(p, False)
+    assert '_restart_required' not in p.config
+    assert p.to_dict()['restart_required'] is False
+
+
+def test_restart_required_survives_a_config_put(app):
+    """The flag is panel-managed: a user config PUT must not be able to clear
+    (or forge) it, same guarantee as _signature/_frontend_hashes."""
+    assert '_restart_required' in plugin_service.RESERVED_PLUGIN_CONFIG_KEYS
+
+
+def test_boot_load_clears_restart_required(app, injected_plugin, monkeypatch):
+    """The restart the flag asked for actually clears it."""
+    from flask import Blueprint
+
+    api_mod = types.ModuleType(f'app.plugins.{SLUG}.api')
+    bp = Blueprint('testext_api', __name__)
+
+    @bp.route('/ping')
+    def _ping():  # an empty blueprint contributes no URL rules
+        return {'ok': True}
+
+    api_mod.test_bp = bp
+    sys.modules[f'app.plugins.{SLUG}.api'] = api_mod
+
+    # The synthetic plugin has no files on disk; the repair pass would flip it
+    # to 'error' before the loader ever sees it.
+    monkeypatch.setattr(plugin_service, 'repair_missing_plugins', lambda: None)
+
+    p = _plugin_row({})
+    p.entry_point = 'api:test_bp'
+    p.url_prefix = f'/api/v1/{SLUG}'
+    db.session.commit()
+    plugin_service._set_restart_required(p, True, reason='pending')
+    assert p.to_dict()['restart_required'] is True
+
+    plugin_service.load_all_plugins(app)
+
+    # load_all_plugins runs in its own app context, and Flask-SQLAlchemy scopes
+    # the session to the context — so re-read the row rather than trusting the
+    # instance this session loaded before the call.
+    db.session.expire_all()
+    reloaded = InstalledPlugin.query.filter_by(slug=SLUG).first()
+    assert reloaded.status == InstalledPlugin.STATUS_ACTIVE
+    assert reloaded.to_dict()['restart_required'] is False
+    assert any(r.rule.startswith(f'/api/v1/{SLUG}') for r in app.url_map.iter_rules())

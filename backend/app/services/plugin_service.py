@@ -617,6 +617,31 @@ def _record_signature_status(plugin, sig_result):
     db.session.commit()
 
 
+def _set_restart_required(plugin, needed, reason=''):
+    """Flag (or clear) "this extension needs a panel restart to serve its API".
+
+    Flask refuses ``register_blueprint`` once the app has handled its first
+    request, so an extension installed on a *running* panel gets its files,
+    its DB row and ``status='active'`` — but no mounted routes. Every call to
+    its API then 404s until the process restarts, which reads to the operator
+    as a broken extension rather than a pending restart.
+
+    Stamped under the panel-managed ``_restart_required`` reserved config key
+    (same namespace as ``_signature``, so config PUTs can't forge it) and
+    surfaced by ``InstalledPlugin.to_dict`` for the Extensions UI. Cleared by
+    :func:`load_all_plugins` once the blueprint actually loads at boot.
+    """
+    cfg = dict(plugin.config or {})
+    if needed:
+        cfg['_restart_required'] = {'reason': reason} if reason else True
+    elif '_restart_required' not in cfg:
+        return  # nothing to clear — don't write on every boot
+    else:
+        cfg.pop('_restart_required', None)
+    plugin.config = cfg
+    db.session.commit()
+
+
 def install_from_url(url, user_id=None, expected_sha256=None, force=False,
                      hot_load=True, source_type=None,
                      expected_signature=None, expected_key_id=None):
@@ -1122,12 +1147,19 @@ def _install_from_buffer(buf, source_url, source_type, user_id=None, force=False
         # different source never keeps a stale 'verified' badge.
         _record_signature_status(plugin, sig_result)
 
-        # Try to register the blueprint immediately (hot-load)
+        # Try to register the blueprint immediately (hot-load). Flask rejects
+        # this once the app has served a request, which is the normal case for
+        # an install on a running panel — flag the row so the UI can tell the
+        # operator a restart is pending instead of leaving them with an
+        # 'active' extension whose routes all 404.
         if has_backend and entry_point and hot_load:
             try:
                 _register_plugin_blueprint(plugin)
+                _set_restart_required(plugin, False)
             except Exception as e:
                 logger.warning(f'Blueprint hot-load failed for {slug} (will load on restart): {e}')
+                _set_restart_required(
+                    plugin, True, reason='Backend routes load when the panel restarts')
 
         # Regenerate frontend plugin manifest
         if has_frontend:
@@ -1485,6 +1517,8 @@ def load_all_plugins(app):
                 _attach_status_guard(bp, plugin.slug)
                 app.register_blueprint(bp, url_prefix=plugin.url_prefix)
                 logger.info(f'Loaded plugin: {plugin.display_name} v{plugin.version} at {plugin.url_prefix}')
+                # The restart this plugin was waiting for just happened.
+                _set_restart_required(plugin, False)
 
                 manifest = plugin.manifest or {}
                 _register_extra_blueprints(app.register_blueprint, plugin, manifest)
@@ -1779,8 +1813,9 @@ def get_plugin_by_slug(slug):
 
 # Plugin-config keys the panel owns — never user-editable, preserved across a
 # config PUT. The runtime-frontend loader's per-bundle sha256 hashes live here,
-# and so does the install-time signature verdict (plan 55).
-RESERVED_PLUGIN_CONFIG_KEYS = ('_frontend_hashes', '_signature')
+# so does the install-time signature verdict (plan 55), and so does the
+# pending-restart flag set when a blueprint can't hot-load into a running app.
+RESERVED_PLUGIN_CONFIG_KEYS = ('_frontend_hashes', '_signature', '_restart_required')
 
 
 def _record_frontend_hashes(plugin, manifest, frontend_dest):
@@ -1997,10 +2032,14 @@ def install_builtin_extension(slug, user_id=None):
                 plugin = _seed_flagship_row(entry)
                 try:
                     _register_plugin_blueprint(plugin)
+                    _set_restart_required(plugin, False)
                 except Exception as e:
                     logger.warning(
                         f'Flagship blueprint hot-load failed for {slug} '
                         f'(will load on restart): {e}')
+                    _set_restart_required(
+                        plugin, True,
+                        reason='Backend routes load when the panel restarts')
                 return plugin
         raise ValueError(f"No builtin extension with slug '{slug}'")
 
