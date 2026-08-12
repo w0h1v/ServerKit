@@ -50,7 +50,13 @@ def install_dirs(tmp_path, monkeypatch):
     added = str(backend)
     app_pkg_plugins = importlib.import_module('app.plugins')
     if added not in app_pkg_plugins.__path__:
-        app_pkg_plugins.__path__.append(added)
+        # insert(0), NOT append: on a machine where this extension is genuinely
+        # installed, backend/app/plugins/<slug>/ already exists and — being the
+        # real package directory — wins the import. Appending therefore made
+        # these tests exercise the INSTALLED copy instead of the freshly-copied
+        # source, so a source change could look untested (or a stale installed
+        # copy could fail tests that are actually fine). Take precedence.
+        app_pkg_plugins.__path__.insert(0, added)
 
     yield {'backend': backend, 'frontend': frontend}
 
@@ -114,3 +120,143 @@ def test_backend_acquisition_upgrades_frontend_only_install(app, install_dirs):
     assert refreshed.has_backend is True
     rules = [r.rule for r in app.url_map.iter_rules()]
     assert any(r.startswith('/api/v1/cloud/') for r in rules)
+
+
+# --------------------------------------------------------------------------- #
+# Destroy safety. `_provider_destroy` used to discard the provider's response
+# entirely, and `destroy_server` marked the row destroyed even when an exception
+# escaped — so a refused delete (bad key, rate limit, provider 5xx) was recorded
+# as a successful destroy. The server kept running and billing while the operator
+# stopped seeing it, and nothing in the panel ever mentioned it again.
+# --------------------------------------------------------------------------- #
+
+class _Resp:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f'{self.status_code} error')
+
+
+@pytest.fixture
+def cloud_server(app, install_dirs):
+    """An active Vultr server row with the extension installed."""
+    plugin_service.install_builtin_extension(SLUG)
+    from app.models.cloud_server import CloudProvider, CloudServer
+
+    provider = CloudProvider(name='Vultr', provider_type='vultr',
+                             api_key_encrypted='', is_active=True)
+    db.session.add(provider)
+    db.session.commit()
+
+    server = CloudServer(provider_id=provider.id, external_id='vultr-abc-123',
+                         name='doomed', status=CloudServer.STATUS_ACTIVE)
+    db.session.add(server)
+    db.session.commit()
+
+    svc = importlib.import_module(f'{_PKG}.cloud_provisioning_service').CloudProvisioningService
+    return {'svc': svc, 'server': server, 'provider': provider}
+
+
+def test_refused_destroy_does_not_mark_server_destroyed(cloud_server, monkeypatch):
+    """The regression that matters: provider says no, row must stay active."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    calls = []
+    monkeypatch.setattr(requests, 'delete',
+                        lambda *a, **k: (calls.append(a), _Resp(500))[1])
+
+    svc, server = cloud_server['svc'], cloud_server['server']
+    with pytest.raises(requests.HTTPError):
+        svc.destroy_server(server.id)
+
+    assert len(calls) == 1
+    row = CloudServer.query.get(server.id)
+    assert row.status == CloudServer.STATUS_ACTIVE, 'a refused delete must not record a destroy'
+    assert row.destroyed_at is None
+
+
+def test_unauthorized_destroy_does_not_mark_server_destroyed(cloud_server, monkeypatch):
+    """A revoked or wrong API key is the likeliest cause in practice."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    monkeypatch.setattr(requests, 'delete', lambda *a, **k: _Resp(401))
+    svc, server = cloud_server['svc'], cloud_server['server']
+    with pytest.raises(requests.HTTPError):
+        svc.destroy_server(server.id)
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_ACTIVE
+
+
+def test_provider_404_counts_as_already_gone(cloud_server, monkeypatch):
+    """Already deleted remotely IS the desired end state, so it converges."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    monkeypatch.setattr(requests, 'delete', lambda *a, **k: _Resp(404))
+    svc, server = cloud_server['svc'], cloud_server['server']
+    assert svc.destroy_server(server.id) is True
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_DESTROYED
+
+
+def test_successful_destroy_marks_destroyed(cloud_server, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    monkeypatch.setattr(requests, 'delete', lambda *a, **k: _Resp(204))
+    svc, server = cloud_server['svc'], cloud_server['server']
+    assert svc.destroy_server(server.id) is True
+    row = CloudServer.query.get(server.id)
+    assert row.status == CloudServer.STATUS_DESTROYED
+    assert row.destroyed_at is not None
+
+
+def test_destroy_is_idempotent_without_recontacting_provider(cloud_server, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    calls = []
+    monkeypatch.setattr(requests, 'delete',
+                        lambda *a, **k: (calls.append(a), _Resp(204))[1])
+    svc, server = cloud_server['svc'], cloud_server['server']
+
+    assert svc.destroy_server(server.id) is True
+    assert svc.destroy_server(server.id) is True
+    assert len(calls) == 1, 'second destroy should converge locally, not re-delete'
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_DESTROYED
+
+
+def test_destroy_endpoint_reports_502_not_404_when_provider_refuses(
+        cloud_server, client, auth_headers, monkeypatch):
+    """404 would read as 'already gone' — the opposite of what happened."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    monkeypatch.setattr(requests, 'delete', lambda *a, **k: _Resp(500))
+    server = cloud_server['server']
+
+    resp = client.delete(f'/api/v1/cloud/servers/{server.id}', headers=auth_headers)
+    assert resp.status_code == 502, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body['destroyed'] is False
+    assert 'refused' in body['error'].lower()
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_ACTIVE
+
+
+def test_destroy_endpoint_still_404s_for_unknown_server(
+        cloud_server, client, auth_headers):
+    resp = client.delete('/api/v1/cloud/servers/999999', headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_unsupported_provider_type_raises(cloud_server, monkeypatch):
+    """Matches _provider_resize, which already guards this."""
+    svc = cloud_server['svc']
+    provider = cloud_server['provider']
+    provider.provider_type = 'nephelo-cloud'
+    db.session.commit()
+    with pytest.raises(ValueError, match='Unsupported provider type'):
+        svc.destroy_server(cloud_server['server'].id)

@@ -150,14 +150,25 @@ class CloudProvisioningService:
 
     @staticmethod
     def destroy_server(server_id):
+        """Destroy a server at its provider and record it locally.
+
+        Returns False when there is no such server. Propagates the provider error
+        when the remote delete is refused — the local row is NOT marked destroyed
+        in that case. Recording a destroy that did not happen is the more dangerous
+        of the two failure modes: the operator stops seeing the server while it
+        keeps running and billing, and nothing in the panel ever mentions it again.
+        """
         server = CloudServer.query.get(server_id)
         if not server:
             return False
 
-        try:
-            CloudProvisioningService._provider_destroy(server.provider, server)
-        except Exception as e:
-            logger.error(f'Provider destroy failed: {e}')
+        # Already destroyed: converge without touching the provider again.
+        if server.status == CloudServer.STATUS_DESTROYED:
+            return True
+
+        # Deliberately unguarded — a refused delete must reach the caller so the
+        # API can report it and the row stays visible for a retry.
+        CloudProvisioningService._provider_destroy(server.provider, server)
 
         server.status = CloudServer.STATUS_DESTROYED
         server.destroyed_at = datetime.utcnow()
@@ -366,32 +377,52 @@ class CloudProvisioningService:
 
     @staticmethod
     def _provider_destroy(provider, server):
-        """Delete server from the cloud provider."""
+        """Delete the server at the cloud provider.
+
+        Raises on a refused delete, matching every sibling ``_provider_*`` helper
+        (create/resize/snapshot all call ``raise_for_status``). This one used to
+        discard the response entirely, so a 401/403/429/5xx read exactly like a
+        success and :meth:`destroy_server` recorded the server as destroyed while
+        it kept running — and kept billing.
+        """
         if not server.external_id:
+            # Never reached the provider (creation failed before it got an ID), so
+            # there is nothing remote to delete; the local row is the whole story.
             return
         import requests
         ptype = provider.provider_type
         headers = CloudProvisioningService._auth_headers(provider)
 
+        def _check(resp):
+            # 404 means it is already gone remotely, which IS the desired end
+            # state — treat it as success, or a retry after a partial failure
+            # could never converge.
+            if resp.status_code == 404:
+                return
+            resp.raise_for_status()
+
         if ptype == 'digitalocean':
-            requests.delete(
+            _check(requests.delete(
                 f'https://api.digitalocean.com/v2/droplets/{server.external_id}',
-                headers=headers, timeout=30)
+                headers=headers, timeout=30))
 
         elif ptype == 'hetzner':
-            requests.delete(
+            _check(requests.delete(
                 f'https://api.hetzner.cloud/v1/servers/{server.external_id}',
-                headers=headers, timeout=30)
+                headers=headers, timeout=30))
 
         elif ptype == 'vultr':
-            requests.delete(
+            _check(requests.delete(
                 f'https://api.vultr.com/v2/instances/{server.external_id}',
-                headers=headers, timeout=30)
+                headers=headers, timeout=30))
 
         elif ptype == 'linode':
-            requests.delete(
+            _check(requests.delete(
                 f'https://api.linode.com/v4/linode/instances/{server.external_id}',
-                headers=headers, timeout=30)
+                headers=headers, timeout=30))
+
+        else:
+            raise ValueError(f'Unsupported provider type: {ptype}')
 
     @staticmethod
     def _provider_resize(provider, server, new_size):

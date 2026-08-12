@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, current_app, request, jsonify
 from flask_jwt_extended import jwt_required
 from .cloud_provisioning_service import CloudProvisioningService
 
@@ -95,8 +95,18 @@ def destroy_server(server_id):
     user = get_current_user()
     if not user or not user.is_admin:
         return jsonify({'error': 'Admin access required'}), 403
-    if not CloudProvisioningService.destroy_server(server_id):
-        return jsonify({'error': 'Not found'}), 404
+    try:
+        if not CloudProvisioningService.destroy_server(server_id):
+            return jsonify({'error': 'Not found'}), 404
+    except Exception as e:
+        # The provider refused the delete, so the server is still running. Say so
+        # instead of reporting a destroy that did not happen — and keep it 502
+        # rather than 404, which would read as "already gone".
+        current_app.logger.error('Cloud destroy refused for server %s: %s', server_id, e)
+        return jsonify({
+            'error': f'Provider refused the delete: {e}',
+            'destroyed': False,
+        }), 502
     return jsonify({'message': 'Server destroyed'})
 
 
