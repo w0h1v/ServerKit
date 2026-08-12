@@ -101,6 +101,10 @@ new_templates/
 /.claude/settings.local.json
 /serverkit.db
 /backend/instance/serverkit.db
+# DATABASE_URL commonly points here (sqlite:////…/data/serverkit.db). The file
+# holds encrypted provider credentials, so it must never be committable — the
+# two patterns above predate this layout and did not cover it.
+/data/
 
 # Logs & Temp
 *.log
