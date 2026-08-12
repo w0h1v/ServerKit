@@ -7,6 +7,15 @@ from app.utils.crypto import encrypt_secret, decrypt_secret_safe, is_encrypted
 logger = logging.getLogger(__name__)
 
 
+class AdoptedServerError(Exception):
+    """Raised when a destructive action targets a server ServerKit did not create.
+
+    An adopted server pre-existed at the provider; the panel imported it so it
+    could be *seen*, which is not the same as being licensed to delete it. The API
+    turns this into a 409 rather than attempting the delete.
+    """
+
+
 class CloudProvisioningService:
     """Service for provisioning cloud servers via provider APIs."""
 
@@ -197,6 +206,114 @@ class CloudProvisioningService:
             'missing_remote': missing_remote,
         }
 
+    # Remote fields worth keeping current on an already-tracked server. Name is
+    # NOT here on purpose: an operator may have renamed it in the panel, and a
+    # sync should not overwrite that with the provider's label.
+    _SYNC_FIELDS = ('region', 'size', 'image', 'ip_address', 'ipv6_address', 'status')
+
+    @classmethod
+    def sync_provider(cls, provider_id, user_id=None):
+        """Adopt everything at the provider we do not track, and refresh what we do.
+
+        Returns a summary: adopted / updated / missing_remote counts plus the rows
+        touched. Never destroys anything — a server that vanished from the provider
+        is flagged ``missing_remote`` for a human, because absence from a listing is
+        not an observed destroy.
+        """
+        provider = CloudProvider.query.get(provider_id)
+        if not provider:
+            return None
+
+        remote = cls._provider_list_remote(provider)
+        now = datetime.utcnow()
+
+        local = CloudServer.query.filter(
+            CloudServer.provider_id == provider_id,
+            CloudServer.status != CloudServer.STATUS_DESTROYED,
+        ).all()
+        by_ext = {s.external_id: s for s in local if s.external_id}
+
+        adopted, updated = [], []
+        for entry in remote:
+            existing = by_ext.get(entry['external_id'])
+            if existing is None:
+                server = CloudServer(
+                    provider_id=provider.id,
+                    external_id=entry['external_id'],
+                    name=entry['name'],
+                    region=entry['region'],
+                    size=entry['size'],
+                    image=entry['image'],
+                    ip_address=entry['ip_address'],
+                    ipv6_address=entry['ipv6_address'],
+                    status=entry['status'],
+                    # We did not create this server, so we do not own its lifecycle.
+                    origin=CloudServer.ORIGIN_ADOPTED,
+                    sync_state=CloudServer.SYNC_IN_SYNC,
+                    last_synced_at=now,
+                    created_by=user_id,
+                )
+                db.session.add(server)
+                adopted.append(server)
+            else:
+                changed = False
+                for field in cls._SYNC_FIELDS:
+                    value = entry.get(field)
+                    if value is not None and getattr(existing, field) != value:
+                        setattr(existing, field, value)
+                        changed = True
+                existing.sync_state = CloudServer.SYNC_IN_SYNC
+                existing.last_synced_at = now
+                if changed:
+                    updated.append(existing)
+
+        remote_ids = {e['external_id'] for e in remote}
+        missing = []
+        for server in local:
+            if server.external_id and server.external_id not in remote_ids:
+                # Deliberately NOT status=destroyed: we never saw it destroyed.
+                server.sync_state = CloudServer.SYNC_MISSING_REMOTE
+                server.last_synced_at = now
+                missing.append(server)
+
+        db.session.commit()
+
+        return {
+            'provider_id': provider.id,
+            'adopted': [s.to_dict() for s in adopted],
+            'updated': [s.to_dict() for s in updated],
+            'missing_remote': [s.to_dict() for s in missing],
+            'remote_total': len(remote),
+        }
+
+    @staticmethod
+    def account_charges(provider):
+        """Charges as the PROVIDER reports them, or None if unavailable.
+
+        Vultr accumulates charges per ACCOUNT, not per instance (every instance's
+        own figure reads 0), so this is the only truthful cost number available.
+        Splitting it across instances would look authoritative and be invented.
+        """
+        import requests
+        if provider.provider_type != 'vultr':
+            return None
+        try:
+            resp = requests.get('https://api.vultr.com/v2/account',
+                                headers=CloudProvisioningService._auth_headers(provider),
+                                timeout=20)
+            resp.raise_for_status()
+            acct = (resp.json() or {}).get('account') or {}
+        except Exception as e:
+            logger.warning('Could not read %s account charges: %s', provider.name, e)
+            return None
+        return {
+            'provider_id': provider.id,
+            'provider_name': provider.name,
+            'pending_charges': acct.get('pending_charges'),
+            'balance': acct.get('balance'),
+            'currency': 'USD',
+        }
+
     @staticmethod
     def get_provider_options(provider_type):
         return CloudProvisioningService.SUPPORTED_PROVIDERS.get(provider_type, {})
@@ -286,6 +403,15 @@ class CloudProvisioningService:
         server = CloudServer.query.get(server_id)
         if not server:
             return False
+
+        # An adopted server is not ours to delete. We imported it so it could be
+        # seen; destroying it would take out infrastructure the panel never
+        # provisioned, on a click that looks identical to destroying our own.
+        if (server.origin or CloudServer.ORIGIN_PROVISIONED) == CloudServer.ORIGIN_ADOPTED:
+            raise AdoptedServerError(
+                f'"{server.name}" was adopted from {server.provider.name if server.provider else "the provider"}, '
+                'not created by ServerKit. Destroy it from the provider\'s own console.'
+            )
 
         # Already destroyed: converge without touching the provider again.
         if server.status == CloudServer.STATUS_DESTROYED:
@@ -378,10 +504,26 @@ class CloudProvisioningService:
             by_provider[key]['cost'] += s.monthly_cost or 0
             total += s.monthly_cost or 0
 
+        # An adopted server carries no monthly_cost (the provider does not report a
+        # per-instance figure), so the local total UNDERSTATES what is being spent.
+        # Report what the provider itself says alongside it rather than presenting a
+        # local sum as if it were the bill.
+        account = []
+        for provider in CloudProvider.query.filter_by(is_active=True).all():
+            charges = CloudProvisioningService.account_charges(provider)
+            if charges:
+                account.append(charges)
+
         return {
             'total_monthly': round(total, 2),
             'server_count': len(servers),
             'by_provider': by_provider,
+            # Authoritative, provider-reported. Empty when no provider supports it.
+            'account_charges': account,
+            'local_total_is_partial': any(
+                (s.origin or CloudServer.ORIGIN_PROVISIONED) == CloudServer.ORIGIN_ADOPTED
+                for s in servers
+            ),
         }
 
     # --- Provider API helpers ---

@@ -24,6 +24,9 @@ const CloudProvision = () => {
     const [showCreateServer, setShowCreateServer] = useState(false);
     const [providerOptions, setProviderOptions] = useState(null);
     const [deleteConfirm, setDeleteConfirm] = useState(null);
+    const [importPreview, setImportPreview] = useState(null);
+    const [discovering, setDiscovering] = useState(false);
+    const [importing, setImporting] = useState(false);
 
     const [providerForm, setProviderForm] = useState({ name: '', provider_type: 'digitalocean', api_key: '' });
     const [serverForm, setServerForm] = useState({ name: '', provider_id: '', region: '', size: '', image: '', install_agent: true });
@@ -46,17 +49,6 @@ const CloudProvision = () => {
     }, [toast]);
 
     useEffect(() => { loadData(); }, [loadData]);
-
-    // Publish the admin actions to the shared tab-group top bar.
-    useTopbarActions(() =>
-        user?.is_admin ? (
-            <>
-                <Button size="sm" variant="outline" onClick={() => setShowCreateProvider(true)}>Add Provider</Button>
-                <Button size="sm" onClick={() => setShowCreateServer(true)}>New Server</Button>
-            </>
-        ) : null,
-        [user?.is_admin]
-    );
 
     const handleCreateProvider = async () => {
         try {
@@ -92,6 +84,70 @@ const CloudProvision = () => {
         } catch (err) { toast.error(err.message); }
     };
 
+    // Import: preview first (read-only), then adopt only on explicit confirmation.
+    // Never adopt as a side effect of opening this page.
+    const handleDiscover = async () => {
+        const importable = providers.filter(p => p.supports_discovery);
+        if (!importable.length) {
+            toast.error('None of your providers support importing yet');
+            return;
+        }
+        setDiscovering(true);
+        try {
+            const results = await Promise.all(
+                importable.map(p => api.discoverCloudProvider(p.id)
+                    .then(r => ({ provider: p, ...r }))
+                    .catch(err => ({ provider: p, error: err.message }))),
+            );
+            setImportPreview(results);
+        } finally {
+            setDiscovering(false);
+        }
+    };
+
+    const handleConfirmImport = async () => {
+        setImporting(true);
+        try {
+            const targets = (importPreview || []).filter(r => !r.error && r.new?.length);
+            const results = await Promise.all(
+                targets.map(r => api.syncCloudProvider(r.provider.id)
+                    .then(res => ({ ok: true, ...res }))
+                    .catch(err => ({ ok: false, error: err.message }))),
+            );
+            const adopted = results.reduce((n, r) => n + (r.adopted?.length || 0), 0);
+            const failed = results.filter(r => !r.ok);
+            if (adopted) toast.success(`Imported ${adopted} server${adopted === 1 ? '' : 's'}`);
+            failed.forEach(r => toast.error(r.error));
+            if (!adopted && !failed.length) toast.info('Nothing new to import');
+            setImportPreview(null);
+            loadData();
+        } finally {
+            setImporting(false);
+        }
+    };
+
+    const canImport = providers.some(p => p.supports_discovery);
+    const previewNewCount = (importPreview || [])
+        .reduce((n, r) => n + (r.new?.length || 0), 0);
+
+    // Registered AFTER the handlers it references: these are `const`, so reading
+    // them from a deps array declared above would hit the temporal dead zone and
+    // throw on first render.
+    useTopbarActions(() =>
+        user?.is_admin ? (
+            <>
+                <Button size="sm" variant="outline" onClick={() => setShowCreateProvider(true)}>Add Provider</Button>
+                {canImport && (
+                    <Button size="sm" variant="outline" disabled={discovering} onClick={handleDiscover}>
+                        {discovering ? 'Checking…' : 'Import existing'}
+                    </Button>
+                )}
+                <Button size="sm" onClick={() => setShowCreateServer(true)}>New Server</Button>
+            </>
+        ) : null,
+        [user?.is_admin, canImport, discovering]
+    );
+
     const providerTypes = {
         digitalocean: 'DigitalOcean', hetzner: 'Hetzner Cloud', vultr: 'Vultr', linode: 'Linode'
     };
@@ -120,6 +176,16 @@ const CloudProvision = () => {
                                 <div className="cloud-server-card__header">
                                     <h3>{srv.name}</h3>
                                     <Badge variant={serverStatusVariant(srv.status)}>{srv.status}</Badge>
+                                    {srv.origin === 'adopted' && (
+                                        <Badge variant="outline" title="Imported from the provider — ServerKit did not create it">
+                                            Adopted
+                                        </Badge>
+                                    )}
+                                    {srv.sync_state === 'missing_remote' && (
+                                        <Badge variant="warning" title="The provider no longer lists this server. It has NOT been destroyed here — confirm at the provider before removing it.">
+                                            Missing at provider
+                                        </Badge>
+                                    )}
                                 </div>
                                 <div className="cloud-server-card__meta">
                                     <span>{srv.provider_name}</span>
@@ -128,11 +194,15 @@ const CloudProvision = () => {
                                 </div>
                                 {srv.ip_address && <div className="text-mono">{srv.ip_address}</div>}
                                 <div className="cloud-server-card__cost">
-                                    ${srv.monthly_cost}/mo
+                                    {srv.monthly_cost
+                                        ? `$${srv.monthly_cost}/mo`
+                                        : <span className="text-muted" title="The provider bills this at the account level, not per server">Billed by provider</span>}
                                 </div>
                                 <div className="cloud-server-card__actions">
                                     {srv.agent_installed && <Badge variant="success">Agent Installed</Badge>}
-                                    {user?.is_admin && srv.status === 'active' && (
+                                    {/* can_destroy is false for adopted servers: destroying one would
+                                        take out infrastructure ServerKit never provisioned. */}
+                                    {user?.is_admin && srv.status === 'active' && srv.can_destroy !== false && (
                                         <Button size="sm" variant="destructive" onClick={() => setDeleteConfirm(srv)}>Destroy</Button>
                                     )}
                                 </div>
@@ -143,8 +213,24 @@ const CloudProvision = () => {
                                 size="lg"
                                 icon={Server}
                                 title="No cloud servers yet"
-                                description={user?.is_admin ? 'Add a provider, then create a server.' : 'No servers have been provisioned.'}
-                                action={user?.is_admin && <Button onClick={() => setShowCreateServer(true)}>New Server</Button>}
+                                description={user?.is_admin
+                                    ? (canImport
+                                        // This page only ever listed servers ServerKit created, which
+                                        // read as "broken" to anyone whose provider account was
+                                        // already full. Say so, and offer the import.
+                                        ? 'This page lists servers ServerKit manages. If your provider account already has servers, import them.'
+                                        : 'Add a provider, then create a server.')
+                                    : 'No servers have been provisioned.'}
+                                action={user?.is_admin && (
+                                    <>
+                                        {canImport && (
+                                            <Button variant="outline" disabled={discovering} onClick={handleDiscover}>
+                                                {discovering ? 'Checking…' : 'Import existing servers'}
+                                            </Button>
+                                        )}
+                                        <Button onClick={() => setShowCreateServer(true)}>New Server</Button>
+                                    </>
+                                )}
                             />
                         )}
                     </div>
@@ -174,8 +260,37 @@ const CloudProvision = () => {
                 <TabsContent value="costs">
                     {costs && (
                         <div className="costs-panel card">
+                            {(costs.account_charges || []).length > 0 && (
+                                <>
+                                    <h3>Charges reported by your provider</h3>
+                                    <div className="cost-breakdown">
+                                        {costs.account_charges.map(a => (
+                                            <div key={a.provider_id} className="cost-row">
+                                                <span>{a.provider_name}</span>
+                                                <span>
+                                                    {a.pending_charges != null
+                                                        ? `$${Number(a.pending_charges).toFixed(2)} pending`
+                                                        : 'pending charges unavailable'}
+                                                </span>
+                                                <span>
+                                                    {a.balance != null ? `balance $${Number(a.balance).toFixed(2)}` : ''}
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </>
+                            )}
+
                             <h3>Monthly Cost Summary</h3>
                             <div className="cost-total">${costs.total_monthly}/mo across {costs.server_count} servers</div>
+                            {costs.local_total_is_partial && (
+                                // An adopted server has no per-instance price, so this sum is not the
+                                // bill. Saying so beats showing a confidently wrong total.
+                                <p className="text-muted">
+                                    Excludes imported servers — your provider bills those at the account
+                                    level, so the figure above is not your full spend.
+                                </p>
+                            )}
                             <div className="cost-breakdown">
                                 {Object.entries(costs.by_provider || {}).map(([name, data]) => (
                                     <div key={name} className="cost-row">
@@ -227,6 +342,58 @@ const CloudProvision = () => {
                     </>
                 )}
                 <div className="form-group"><label className="checkbox-label"><input type="checkbox" checked={serverForm.install_agent} onChange={e => setServerForm({...serverForm, install_agent: e.target.checked})} /> Auto-install ServerKit agent</label></div>
+            </Modal>
+
+            <Modal
+                open={Boolean(importPreview)}
+                onClose={() => setImportPreview(null)}
+                title="Import existing servers"
+                footer={(
+                    <>
+                        <Button variant="outline" onClick={() => setImportPreview(null)}>Cancel</Button>
+                        <Button
+                            disabled={importing || previewNewCount === 0}
+                            onClick={handleConfirmImport}
+                        >
+                            {importing
+                                ? 'Importing…'
+                                : `Import ${previewNewCount} server${previewNewCount === 1 ? '' : 's'}`}
+                        </Button>
+                    </>
+                )}
+            >
+                <p className="text-muted">
+                    Nothing has been imported yet. Imported servers are shown and monitored, but
+                    ServerKit will not offer to destroy them — it did not create them.
+                </p>
+                {(importPreview || []).map(result => (
+                    <div key={result.provider.id} className="form-group">
+                        <label>{result.provider.name}</label>
+                        {result.error && <p className="text-muted">Could not read this provider: {result.error}</p>}
+                        {!result.error && (
+                            <>
+                                {(result.new || []).length === 0 && (
+                                    <p className="text-muted">
+                                        Nothing new — all {result.remote_total} server(s) are already tracked.
+                                    </p>
+                                )}
+                                {(result.new || []).map(entry => (
+                                    <div key={entry.external_id} className="cost-row">
+                                        <span>{entry.name}</span>
+                                        <span>{entry.region} · {entry.size}</span>
+                                        <span>{entry.status}</span>
+                                    </div>
+                                ))}
+                                {(result.missing_remote || []).length > 0 && (
+                                    <p className="text-muted">
+                                        {result.missing_remote.length} tracked server(s) are no longer at
+                                        this provider. They will be flagged, not destroyed.
+                                    </p>
+                                )}
+                            </>
+                        )}
+                    </div>
+                ))}
             </Modal>
 
             {deleteConfirm && (

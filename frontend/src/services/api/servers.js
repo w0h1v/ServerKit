@@ -999,6 +999,18 @@ export async function getCloudProviderOptions(type) {
     return this.request(`/cloud/providers/${type}/options`);
 }
 
+// Read-only preview of what an import WOULD adopt. Writes nothing, so it is safe
+// to call before asking the operator to confirm.
+export async function discoverCloudProvider(id) {
+    return this.request(`/cloud/providers/${id}/discover`);
+}
+
+// Adopt the provider's untracked servers and refresh the tracked ones. Destroys
+// nothing — a server missing remotely is flagged, never deleted.
+export async function syncCloudProvider(id) {
+    return this.request(`/cloud/providers/${id}/sync`, { method: 'POST' });
+}
+
 export async function getCloudServers(providerId) {
     const query = providerId ? `?provider_id=${providerId}` : '';
     return this.request(`/cloud/servers${query}`);

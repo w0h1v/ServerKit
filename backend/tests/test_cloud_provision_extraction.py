@@ -421,3 +421,168 @@ def test_adopted_server_reports_it_cannot_be_destroyed(cloud_server):
     db.session.commit()
     assert server.to_dict()['can_destroy'] is False
     assert server.to_dict()['origin'] == 'adopted'
+
+
+# --------------------------------------------------------------------------- #
+# Sync / adopt (step 4) and account-level cost (step 6).
+# --------------------------------------------------------------------------- #
+
+def test_sync_adopts_untracked_servers(cloud_server, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({'instances': [
+        _vultr_instance('vultr-abc-123', label='doomed'),          # already tracked
+        _vultr_instance('new-1', label='labs', region='dfw'),
+        _vultr_instance('new-2', power='stopped'),
+    ]}))
+
+    result = svc.sync_provider(provider.id, user_id=None)
+    assert len(result['adopted']) == 2
+    assert result['missing_remote'] == []
+
+    adopted = CloudServer.query.filter_by(origin=CloudServer.ORIGIN_ADOPTED).all()
+    assert {s.external_id for s in adopted} == {'new-1', 'new-2'}
+    for s in adopted:
+        assert s.sync_state == CloudServer.SYNC_IN_SYNC
+        assert s.last_synced_at is not None
+        assert s.to_dict()['can_destroy'] is False
+    # The stopped one keeps its real power state rather than defaulting to active.
+    assert CloudServer.query.filter_by(external_id='new-2').first().status == CloudServer.STATUS_OFF
+
+
+def test_sync_is_idempotent(cloud_server, monkeypatch):
+    """Re-running must not duplicate rows — the unique constraint's whole point."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'instances': [_vultr_instance('new-1', label='labs')]}))
+
+    first = svc.sync_provider(provider.id)
+    second = svc.sync_provider(provider.id)
+    assert len(first['adopted']) == 1
+    assert second['adopted'] == []
+    assert CloudServer.query.filter_by(external_id='new-1').count() == 1
+
+
+def test_sync_refreshes_changed_fields_but_keeps_local_name(cloud_server, monkeypatch):
+    """A rename in the panel must survive a sync; drifted specs must not."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider, tracked = (cloud_server['svc'], cloud_server['provider'],
+                              cloud_server['server'])
+    tracked.name = 'renamed-by-operator'
+    db.session.commit()
+
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({'instances': [
+        _vultr_instance('vultr-abc-123', label='provider-label',
+                        region='lax', plan='vc2-4c-8gb', ip='203.0.113.9'),
+    ]}))
+    svc.sync_provider(provider.id)
+
+    row = CloudServer.query.get(tracked.id)
+    assert row.name == 'renamed-by-operator', 'sync must not clobber a local rename'
+    assert row.region == 'lax'
+    assert row.ip_address == '203.0.113.9'
+    assert row.sync_state == CloudServer.SYNC_IN_SYNC
+
+
+def test_sync_flags_missing_without_destroying(cloud_server, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider, tracked = (cloud_server['svc'], cloud_server['provider'],
+                              cloud_server['server'])
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({'instances': []}))
+
+    result = svc.sync_provider(provider.id)
+    assert len(result['missing_remote']) == 1
+    row = CloudServer.query.get(tracked.id)
+    assert row.sync_state == CloudServer.SYNC_MISSING_REMOTE
+    assert row.status == CloudServer.STATUS_ACTIVE, 'must never auto-destroy'
+    assert row.destroyed_at is None
+
+
+def test_destroy_refuses_adopted_server(cloud_server, monkeypatch):
+    """The guardrail: an adopted server is not ours to delete."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, server = cloud_server['svc'], cloud_server['server']
+    server.origin = CloudServer.ORIGIN_ADOPTED
+    db.session.commit()
+
+    called = []
+    monkeypatch.setattr(requests, 'delete',
+                        lambda *a, **k: (called.append(a), _Resp(204))[1])
+
+    svc_mod = importlib.import_module(f'{_PKG}.cloud_provisioning_service')
+    with pytest.raises(svc_mod.AdoptedServerError):
+        svc.destroy_server(server.id)
+
+    assert called == [], 'must refuse BEFORE contacting the provider'
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_ACTIVE
+
+
+def test_destroy_endpoint_409s_for_adopted_server(
+        cloud_server, client, auth_headers, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+    server = cloud_server['server']
+    server.origin = CloudServer.ORIGIN_ADOPTED
+    db.session.commit()
+    monkeypatch.setattr(requests, 'delete', lambda *a, **k: _Resp(204))
+
+    resp = client.delete(f'/api/v1/cloud/servers/{server.id}', headers=auth_headers)
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body['adopted'] is True and body['destroyed'] is False
+    assert CloudServer.query.get(server.id).status == CloudServer.STATUS_ACTIVE
+
+
+def test_sync_endpoint_requires_admin_and_returns_summary(
+        cloud_server, client, auth_headers, monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'instances': [_vultr_instance('new-9', label='fresh')]}))
+    resp = client.post(
+        f'/api/v1/cloud/providers/{cloud_server["provider"].id}/sync',
+        headers=auth_headers)
+    assert resp.status_code == 200
+    assert len(resp.get_json()['adopted']) == 1
+
+
+def test_cost_summary_reports_provider_charges_and_flags_partial(
+        cloud_server, monkeypatch):
+    """A local sum that silently excludes adopted servers is a wrong bill."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider, tracked = (cloud_server['svc'], cloud_server['provider'],
+                              cloud_server['server'])
+    tracked.origin = CloudServer.ORIGIN_ADOPTED
+    db.session.commit()
+
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'account': {'pending_charges': 70.17, 'balance': 0}}))
+
+    summary = svc.get_cost_summary()
+    assert summary['local_total_is_partial'] is True
+    assert summary['account_charges'][0]['pending_charges'] == 70.17
+    assert summary['account_charges'][0]['provider_name'] == provider.name
+
+
+def test_cost_summary_survives_an_unreachable_provider(cloud_server, monkeypatch):
+    import requests
+
+    def boom(*a, **k):
+        raise requests.ConnectionError('no route to host')
+
+    monkeypatch.setattr(requests, 'get', boom)
+    summary = cloud_server['svc'].get_cost_summary()
+    assert summary['account_charges'] == []
+    assert 'total_monthly' in summary

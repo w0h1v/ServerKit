@@ -1,6 +1,6 @@
 from flask import Blueprint, current_app, request, jsonify
 from flask_jwt_extended import jwt_required
-from .cloud_provisioning_service import CloudProvisioningService
+from .cloud_provisioning_service import AdoptedServerError, CloudProvisioningService
 
 cloud_provisioning_bp = Blueprint('cloud_provisioning', __name__)
 
@@ -75,6 +75,30 @@ def discover_provider(provider_id):
     return jsonify(result)
 
 
+@cloud_provisioning_bp.route('/providers/<int:provider_id>/sync', methods=['POST'])
+@jwt_required()
+def sync_provider(provider_id):
+    """Adopt the provider's untracked servers and refresh the ones we know.
+
+    Destroys nothing: a server that vanished remotely is flagged, never deleted.
+    """
+    user = get_current_user()
+    if not user or not user.is_admin:
+        return jsonify({'error': 'Admin access required'}), 403
+    try:
+        result = CloudProvisioningService.sync_provider(
+            provider_id, user_id=user.id)
+    except NotImplementedError as e:
+        return jsonify({'error': str(e), 'supported': False}), 501
+    except Exception as e:
+        current_app.logger.error('Cloud sync failed for provider %s: %s',
+                                 provider_id, e)
+        return jsonify({'error': f'Could not reach the provider: {e}'}), 502
+    if result is None:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify(result)
+
+
 @cloud_provisioning_bp.route('/providers/<provider_type>/options', methods=['GET'])
 @jwt_required()
 def get_options(provider_type):
@@ -128,6 +152,9 @@ def destroy_server(server_id):
     try:
         if not CloudProvisioningService.destroy_server(server_id):
             return jsonify({'error': 'Not found'}), 404
+    except AdoptedServerError as e:
+        # Refused before contacting the provider: this server is not ours to delete.
+        return jsonify({'error': str(e), 'destroyed': False, 'adopted': True}), 409
     except Exception as e:
         # The provider refused the delete, so the server is still running. Say so
         # instead of reporting a destroy that did not happen — and keep it 502
