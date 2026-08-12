@@ -1304,6 +1304,60 @@ def _register_extra_blueprints(register, plugin, manifest):
                     + (f' (as {name})' if name else ''))
 
 
+def _prefer_builtin_source(plugin):
+    """Make an in-tree builtin import from its SOURCE, not install's copy.
+
+    A builtin install copies ``builtin-extensions/<slug>/backend`` to
+    ``app/plugins/<slug>``. Both then exist, and the copy wins the import because
+    it sits in the real package directory — so editing the source changed nothing
+    until someone re-installed, and a fixed extension went on running old code
+    with no sign anything was stale. Registering the source in ``sys.modules``
+    first (what FLAGSHIP_SLUGS already do) makes the tree authoritative.
+
+    No-op for anything not installed from a builtin whose source is still present,
+    so registry/URL/upload installs keep loading their extracted copy.
+
+    Note this cannot delegate to :func:`_ensure_builtin_backend_importable`: that
+    one tries ``import_module`` first and so PREFERS the copy, falling back to
+    in-place only when no copy exists (correct for flagships, which are never
+    copied — useless here, where the copy is exactly what we need to bypass).
+    """
+    import importlib
+    import importlib.util
+
+    if (plugin.source_type or '') != 'builtin':
+        return False
+    backend_dir = os.path.join(BUILTIN_EXTENSIONS_DIR, plugin.slug, 'backend')
+    init_py = os.path.join(backend_dir, '__init__.py')
+    if not os.path.isfile(init_py):
+        return False
+
+    pkg = f'app.plugins.{plugin.slug}'
+    loaded = sys.modules.get(pkg)
+    if loaded is not None:
+        if os.path.abspath(getattr(loaded, '__file__', '') or '') == os.path.abspath(init_py):
+            return True  # already the source
+        # Drop the package AND its submodules, or a relative import inside the
+        # extension would still resolve against the copy we are replacing.
+        for name in [n for n in sys.modules
+                     if n == pkg or n.startswith(pkg + '.')]:
+            del sys.modules[name]
+
+    try:
+        importlib.import_module('app.plugins')  # parent package must exist
+        spec = importlib.util.spec_from_file_location(
+            pkg, init_py, submodule_search_locations=[backend_dir]
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[pkg] = module
+        spec.loader.exec_module(module)
+        return True
+    except Exception as e:  # never block a load over this
+        logger.warning('Could not prefer builtin source for %s: %s', plugin.slug, e)
+        sys.modules.pop(pkg, None)
+        return False
+
+
 def _register_plugin_blueprint(plugin):
     """Dynamically register a plugin's Flask blueprint into the running app."""
     from flask import current_app
@@ -1311,6 +1365,9 @@ def _register_plugin_blueprint(plugin):
 
     if not plugin.entry_point:
         return
+
+    # Same reason as in load_all_plugins: the in-tree source is authoritative.
+    _prefer_builtin_source(plugin)
 
     # entry_point format: "blueprint:ai_assistant_bp"
     parts = plugin.entry_point.split(':')
@@ -1510,6 +1567,14 @@ def load_all_plugins(app):
 
                 module_name, bp_name = parts
                 full_module = f'app.plugins.{plugin.slug}.{module_name}'
+
+                # For an in-tree builtin, the source under builtin-extensions/ is
+                # authoritative — not the copy install made under app/plugins/.
+                # Those two drift the moment anyone edits the source, and the copy
+                # silently won the import, so a fixed extension kept running the
+                # old code until someone re-installed it. Flagships already load
+                # this way; this extends it to every builtin.
+                _prefer_builtin_source(plugin)
 
                 import importlib
                 mod = importlib.import_module(full_module)

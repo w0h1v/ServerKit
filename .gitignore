@@ -105,6 +105,8 @@ new_templates/
 # holds encrypted provider credentials, so it must never be committable — the
 # two patterns above predate this layout and did not cover it.
 /data/
+# Touched to ask the serverkit-restart.path unit for a restart; purely local.
+/.restart-request
 
 # Logs & Temp
 *.log

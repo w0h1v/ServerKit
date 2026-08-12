@@ -586,3 +586,60 @@ def test_cost_summary_survives_an_unreachable_provider(cloud_server, monkeypatch
     summary = cloud_server['svc'].get_cost_summary()
     assert summary['account_charges'] == []
     assert 'total_monthly' in summary
+
+
+# --------------------------------------------------------------------------- #
+# In-tree source beats install's copy. A builtin install copies
+# builtin-extensions/<slug>/backend to app/plugins/<slug>; both then exist, and
+# the copy won the import because it sits in the real package directory. Editing
+# the source therefore changed nothing until someone re-installed, and a FIXED
+# extension kept serving old code with nothing to indicate it was stale.
+# --------------------------------------------------------------------------- #
+
+def test_builtin_loads_from_source_not_a_stale_copy(app, install_dirs, monkeypatch):
+    import os
+    plugin_service.install_builtin_extension(SLUG)
+    plugin = InstalledPlugin.query.filter_by(slug=SLUG).first()
+    assert plugin.source_type == 'builtin'
+
+    # Poison the copied file so anything importing it is unmistakable.
+    copied = os.path.join(str(install_dirs['backend']), SLUG,
+                          'cloud_provisioning_service.py')
+    assert os.path.isfile(copied), copied
+    with open(copied, 'w', encoding='utf-8') as f:
+        f.write('STALE_COPY_MARKER = True\n'
+                'class CloudProvisioningService:\n'
+                '    pass\n')
+
+    # Drop cached modules so the next import genuinely re-resolves.
+    for name in list(sys.modules):
+        if name == _PKG or name.startswith(_PKG + '.'):
+            del sys.modules[name]
+
+    assert plugin_service._prefer_builtin_source(plugin) is True
+
+    mod = importlib.import_module(f'{_PKG}.cloud_provisioning_service')
+    assert not hasattr(mod, 'STALE_COPY_MARKER'), 'imported the stale copy, not the source'
+    # A real method only the source has.
+    assert hasattr(mod.CloudProvisioningService, 'discover_provider')
+
+
+def test_prefer_builtin_source_ignores_non_builtin_installs(app):
+    """A registry/upload extension has no in-tree source; keep its extracted copy."""
+    row = InstalledPlugin(name='ext-from-registry', display_name='Reg', version='1.0.0',
+                          slug='ext-from-registry', source_type='registry',
+                          status=InstalledPlugin.STATUS_ACTIVE)
+    row.has_backend = True
+    db.session.add(row)
+    db.session.commit()
+    assert plugin_service._prefer_builtin_source(row) is False
+
+
+def test_prefer_builtin_source_ignores_a_missing_source_tree(app):
+    row = InstalledPlugin(name='serverkit-not-in-tree', display_name='X', version='1.0.0',
+                          slug='serverkit-not-in-tree', source_type='builtin',
+                          status=InstalledPlugin.STATUS_ACTIVE)
+    row.has_backend = True
+    db.session.add(row)
+    db.session.commit()
+    assert plugin_service._prefer_builtin_source(row) is False

@@ -1,0 +1,11 @@
+# Triggered by serverkit-restart.path when the request file is touched.
+# See that file for the rationale and install steps.
+#
+# Deliberately narrow: a fixed ExecStart naming one unit, so the trigger cannot be
+# talked into restarting anything else.
+[Unit]
+Description=Restart ServerKit on request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart serverkit-isolated

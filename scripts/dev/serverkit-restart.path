@@ -1,0 +1,24 @@
+# Watch a request file so an unprivileged developer can restart the panel without
+# sudo. Touching the file is the whole interface:
+#
+#     touch /mnt/dev/serverkit/.restart-request
+#
+# Why this instead of a sudoers entry: it grants exactly ONE capability — restart
+# this one unit — where `NOPASSWD: /usr/bin/systemctl` hands over a broad binary
+# whose argument list is easy to widen later. Every trigger is also recorded in the
+# journal against serverkit-restart.service, so the restarts are auditable.
+#
+# Install (once, as root):
+#     cp scripts/dev/serverkit-restart.{path,service} /etc/systemd/system/
+#     systemctl daemon-reload
+#     systemctl enable --now serverkit-restart.path
+#
+# Adjust PathModified below if SERVERKIT_INSTALL_DIR is not /mnt/dev/serverkit.
+[Unit]
+Description=Watch for a ServerKit restart request
+
+[Path]
+PathModified=/mnt/dev/serverkit/.restart-request
+
+[Install]
+WantedBy=multi-user.target
