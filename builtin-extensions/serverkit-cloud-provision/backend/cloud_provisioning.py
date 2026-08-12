@@ -17,7 +17,14 @@ def get_current_user():
 @jwt_required()
 def list_providers():
     providers = CloudProvisioningService.list_providers()
-    return jsonify({'providers': [p.to_dict() for p in providers]})
+    return jsonify({'providers': [
+        # supports_discovery tells the UI whether to offer "import existing
+        # servers" for this provider, so the affordance is never shown for a
+        # provider whose inventory we cannot enumerate.
+        {**p.to_dict(),
+         'supports_discovery': CloudProvisioningService.supports_discovery(p.provider_type)}
+        for p in providers
+    ]})
 
 
 @cloud_provisioning_bp.route('/providers', methods=['POST'])
@@ -43,6 +50,29 @@ def delete_provider(provider_id):
     if not CloudProvisioningService.delete_provider(provider_id):
         return jsonify({'error': 'Not found'}), 404
     return jsonify({'message': 'Provider removed'})
+
+
+@cloud_provisioning_bp.route('/providers/<int:provider_id>/discover', methods=['GET'])
+@jwt_required()
+def discover_provider(provider_id):
+    """Preview the provider's live inventory against what we already track.
+
+    Read-only by design: nothing is adopted here, so the UI can show what an
+    import would do and take an explicit confirmation. Adoption must never be a
+    side effect of loading a page.
+    """
+    try:
+        result = CloudProvisioningService.discover_provider(provider_id)
+    except NotImplementedError as e:
+        # A provider we hold credentials for but cannot enumerate yet.
+        return jsonify({'error': str(e), 'supported': False}), 501
+    except Exception as e:
+        current_app.logger.error('Cloud discovery failed for provider %s: %s',
+                                 provider_id, e)
+        return jsonify({'error': f'Could not reach the provider: {e}'}), 502
+    if result is None:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify(result)
 
 
 @cloud_provisioning_bp.route('/providers/<provider_type>/options', methods=['GET'])

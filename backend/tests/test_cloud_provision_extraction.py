@@ -260,3 +260,164 @@ def test_unsupported_provider_type_raises(cloud_server, monkeypatch):
     db.session.commit()
     with pytest.raises(ValueError, match='Unsupported provider type'):
         svc.destroy_server(cloud_server['server'].id)
+
+
+# --------------------------------------------------------------------------- #
+# Discovery (adoption step 3). Read-only preview of the provider's inventory:
+# cloud_servers only ever held servers ServerKit created, so a panel whose
+# provider account was full of running instances showed an empty Cloud page with
+# no failure anywhere to explain it.
+# --------------------------------------------------------------------------- #
+
+def _vultr_instance(iid, label='', region='ewr', plan='vc2-1c-1gb',
+                    status='active', power='running', ip='192.0.2.10'):
+    return {'id': iid, 'label': label, 'region': region, 'plan': plan,
+            'os': 'Ubuntu 24.04', 'main_ip': ip, 'v6_main_ip': '',
+            'status': status, 'power_status': power}
+
+
+class _GetResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f'{self.status_code} error')
+
+
+def test_discover_reports_remote_servers_without_writing(cloud_server, monkeypatch):
+    """The whole point of discover: it must adopt nothing."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider, tracked = (cloud_server['svc'], cloud_server['provider'],
+                              cloud_server['server'])
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({
+        'instances': [
+            _vultr_instance('vultr-abc-123', label='doomed'),   # already tracked
+            _vultr_instance('new-1', label='labs', region='dfw'),
+            _vultr_instance('new-2'),                            # unlabelled
+        ],
+        'meta': {'links': {'next': ''}},
+    }))
+
+    before = CloudServer.query.count()
+    result = svc.discover_provider(provider.id)
+
+    assert result['remote_total'] == 3
+    assert {e['external_id'] for e in result['new']} == {'new-1', 'new-2'}
+    assert [e['server_id'] for e in result['tracked']] == [tracked.id]
+    assert result['missing_remote'] == []
+    assert CloudServer.query.count() == before, 'discover must not write rows'
+
+
+def test_discover_names_unlabelled_instances(cloud_server, monkeypatch):
+    """name is NOT NULL, and '(no label)' repeated N times is unusable."""
+    import requests
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'instances': [_vultr_instance('abcdef123456', label='', region='ams')]}))
+
+    entry = svc.discover_provider(provider.id)['new'][0]
+    assert entry['name'] == 'vultr-ams-abcdef12'
+    assert entry['labelled'] is False
+
+
+def test_discover_flags_servers_missing_remotely_without_destroying(
+        cloud_server, monkeypatch):
+    """We did not observe a destroy, so we must not claim one."""
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    svc, provider, tracked = (cloud_server['svc'], cloud_server['provider'],
+                              cloud_server['server'])
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({'instances': []}))
+
+    result = svc.discover_provider(provider.id)
+    assert [m['server_id'] for m in result['missing_remote']] == [tracked.id]
+    row = CloudServer.query.get(tracked.id)
+    assert row.status == CloudServer.STATUS_ACTIVE, 'must not mark destroyed'
+
+
+def test_discover_maps_stopped_instance_to_off(cloud_server, monkeypatch):
+    """A stopped instance is 'off', not 'active' — and it still bills."""
+    import requests
+    from app.models.cloud_server import CloudServer
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'instances': [_vultr_instance('s1', label='halted', power='stopped')]}))
+    assert svc.discover_provider(provider.id)['new'][0]['status'] == CloudServer.STATUS_OFF
+
+
+def test_discover_follows_cursor_pagination(cloud_server, monkeypatch):
+    import requests
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    pages = [
+        _GetResp({'instances': [_vultr_instance('p1', label='one')],
+                  'meta': {'links': {'next': 'CURSOR2'}}}),
+        _GetResp({'instances': [_vultr_instance('p2', label='two')],
+                  'meta': {'links': {'next': ''}}}),
+    ]
+    seen_cursors = []
+
+    def fake_get(url, **kw):
+        seen_cursors.append((kw.get('params') or {}).get('cursor'))
+        return pages[len(seen_cursors) - 1]
+
+    monkeypatch.setattr(requests, 'get', fake_get)
+    result = svc.discover_provider(provider.id)
+    assert result['remote_total'] == 2
+    assert seen_cursors == [None, 'CURSOR2']
+
+
+def test_discover_unsupported_provider_raises_not_implemented(cloud_server):
+    svc, provider = cloud_server['svc'], cloud_server['provider']
+    provider.provider_type = 'hetzner'
+    db.session.commit()
+    with pytest.raises(NotImplementedError):
+        svc.discover_provider(provider.id)
+
+
+def test_discover_endpoint_returns_501_for_unsupported_provider(
+        cloud_server, client, auth_headers):
+    provider = cloud_server['provider']
+    provider.provider_type = 'linode'
+    db.session.commit()
+    resp = client.get(f'/api/v1/cloud/providers/{provider.id}/discover',
+                      headers=auth_headers)
+    assert resp.status_code == 501
+    assert resp.get_json()['supported'] is False
+
+
+def test_discover_endpoint_502s_when_provider_unreachable(
+        cloud_server, client, auth_headers, monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({}, status_code=500))
+    resp = client.get(
+        f'/api/v1/cloud/providers/{cloud_server["provider"].id}/discover',
+        headers=auth_headers)
+    assert resp.status_code == 502
+
+
+def test_providers_list_advertises_discovery_support(
+        cloud_server, client, auth_headers):
+    resp = client.get('/api/v1/cloud/providers', headers=auth_headers)
+    assert resp.status_code == 200
+    vultr = [p for p in resp.get_json()['providers'] if p['provider_type'] == 'vultr']
+    assert vultr and vultr[0]['supports_discovery'] is True
+
+
+def test_adopted_server_reports_it_cannot_be_destroyed(cloud_server):
+    """The guardrail the UI keys off: an adopted server is not ours to destroy."""
+    from app.models.cloud_server import CloudServer
+    server = cloud_server['server']
+    assert server.to_dict()['can_destroy'] is True
+    server.origin = CloudServer.ORIGIN_ADOPTED
+    db.session.commit()
+    assert server.to_dict()['can_destroy'] is False
+    assert server.to_dict()['origin'] == 'adopted'

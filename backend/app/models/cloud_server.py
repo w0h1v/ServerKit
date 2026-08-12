@@ -29,8 +29,14 @@ class CloudProvider(db.Model):
 
 
 class CloudServer(db.Model):
-    """A cloud server provisioned through ServerKit."""
+    """A cloud server ServerKit provisioned, or adopted from the provider."""
     __tablename__ = 'cloud_servers'
+    # One row per remote server. Without this, re-running a discovery/sync would
+    # insert a duplicate for every instance on every pass.
+    __table_args__ = (
+        db.UniqueConstraint('provider_id', 'external_id',
+                            name='uq_cloud_servers_provider_external'),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     provider_id = db.Column(db.Integer, db.ForeignKey('cloud_providers.id'), nullable=False)
@@ -66,6 +72,25 @@ class CloudServer(db.Model):
     # Metadata
     metadata_json = db.Column(db.Text)
 
+    # How this row came to exist. 'provisioned' means ServerKit created the server
+    # and owns its lifecycle; 'adopted' means it already existed at the provider
+    # and was imported, so ServerKit did NOT create it and must not offer to
+    # destroy it — an accidental click there would take out infrastructure the
+    # panel never provisioned.
+    ORIGIN_PROVISIONED = 'provisioned'
+    ORIGIN_ADOPTED = 'adopted'
+    origin = db.Column(db.String(16), default=ORIGIN_PROVISIONED, nullable=False)
+
+    # Reconciliation against the provider. `missing_remote` is set when a server
+    # we know about is no longer returned by the provider; it is deliberately NOT
+    # the same as 'destroyed', because we did not observe a destroy and must not
+    # silently claim one.
+    SYNC_IN_SYNC = 'in_sync'
+    SYNC_DRIFTED = 'drifted'
+    SYNC_MISSING_REMOTE = 'missing_remote'
+    sync_state = db.Column(db.String(16))
+    last_synced_at = db.Column(db.DateTime)
+
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     destroyed_at = db.Column(db.DateTime)
@@ -98,6 +123,12 @@ class CloudServer(db.Model):
             'monthly_cost': self.monthly_cost,
             'currency': self.currency,
             'agent_installed': self.agent_installed,
+            'origin': self.origin or self.ORIGIN_PROVISIONED,
+            # Surfaced so the UI can hide destroy on an adopted server rather than
+            # relying on every caller to remember the rule.
+            'can_destroy': (self.origin or self.ORIGIN_PROVISIONED) == self.ORIGIN_PROVISIONED,
+            'sync_state': self.sync_state,
+            'last_synced_at': self.last_synced_at.isoformat() if self.last_synced_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 

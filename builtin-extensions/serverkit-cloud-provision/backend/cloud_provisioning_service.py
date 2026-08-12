@@ -72,6 +72,131 @@ class CloudProvisioningService:
         db.session.commit()
         return True
 
+    # Provider types whose remote inventory we can enumerate. Everything else
+    # raises NotImplementedError rather than shipping three untested integrations,
+    # and the UI hides the import affordance for them.
+    DISCOVERY_PROVIDERS = ('vultr',)
+
+    @staticmethod
+    def supports_discovery(provider_type):
+        return provider_type in CloudProvisioningService.DISCOVERY_PROVIDERS
+
+    @staticmethod
+    def _vultr_status(instance):
+        """Map a Vultr instance's two status fields onto CloudServer.STATUS_*.
+
+        Vultr reports lifecycle in `status` (active/pending/suspended) and power in
+        `power_status` (running/stopped); a stopped-but-active instance is 'off',
+        not 'active', and it still bills.
+        """
+        status = (instance.get('status') or '').lower()
+        power = (instance.get('power_status') or '').lower()
+        if status == 'pending':
+            return CloudServer.STATUS_CREATING
+        if power == 'stopped':
+            return CloudServer.STATUS_OFF
+        if status == 'active':
+            return CloudServer.STATUS_ACTIVE
+        if status:
+            return CloudServer.STATUS_ERROR
+        return CloudServer.STATUS_ACTIVE
+
+    @staticmethod
+    def _provider_list_remote(provider):
+        """Return the provider's live inventory as normalised dicts.
+
+        Read-only. Shape per entry: external_id, name, region, size, image,
+        ip_address, ipv6_address, status. Cost is deliberately absent — Vultr
+        reports charges at the ACCOUNT level, and inventing a per-instance split
+        would produce an authoritative-looking number that is made up.
+        """
+        import requests
+        ptype = provider.provider_type
+        if ptype != 'vultr':
+            raise NotImplementedError(
+                f'Listing remote servers is not implemented for {ptype}')
+
+        headers = CloudProvisioningService._auth_headers(provider)
+        out = []
+        cursor = None
+        # Cursor-paginated. The page cap is a backstop: a provider that always
+        # returns a `next` link must not spin this forever.
+        for _page in range(50):
+            params = {'per_page': 500}
+            if cursor:
+                params['cursor'] = cursor
+            resp = requests.get('https://api.vultr.com/v2/instances',
+                                headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            body = resp.json() or {}
+            for inst in (body.get('instances') or []):
+                label = (inst.get('label') or '').strip()
+                ext = str(inst.get('id') or '')
+                out.append({
+                    'external_id': ext,
+                    # An unlabelled instance still needs a name: the column is NOT
+                    # NULL, and "(no label)" repeated N times is unusable in a list.
+                    'name': label or f'vultr-{inst.get("region") or "unknown"}-{ext[:8]}',
+                    'region': inst.get('region'),
+                    'size': inst.get('plan'),
+                    'image': inst.get('os'),
+                    'ip_address': inst.get('main_ip') or None,
+                    'ipv6_address': inst.get('v6_main_ip') or None,
+                    'status': CloudProvisioningService._vultr_status(inst),
+                    'labelled': bool(label),
+                })
+            cursor = (((body.get('meta') or {}).get('links') or {}).get('next') or '')
+            if not cursor:
+                break
+        return out
+
+    @staticmethod
+    def discover_provider(provider_id):
+        """Preview what an import WOULD adopt. Writes nothing.
+
+        Separated from sync on purpose: adoption must never happen as a side
+        effect of loading a page, so the UI can show "4 found, 4 new" and take an
+        explicit confirmation first.
+        """
+        provider = CloudProvider.query.get(provider_id)
+        if not provider:
+            return None
+
+        remote = CloudProvisioningService._provider_list_remote(provider)
+
+        local = CloudServer.query.filter(
+            CloudServer.provider_id == provider_id,
+            CloudServer.status != CloudServer.STATUS_DESTROYED,
+        ).all()
+        by_ext = {s.external_id: s for s in local if s.external_id}
+
+        new, tracked = [], []
+        for entry in remote:
+            existing = by_ext.get(entry['external_id'])
+            if existing is None:
+                new.append(entry)
+            else:
+                tracked.append({**entry, 'server_id': existing.id,
+                                'origin': existing.origin})
+
+        remote_ids = {e['external_id'] for e in remote}
+        # Known locally but absent remotely. NOT reported as destroyed: we did not
+        # observe a destroy, so this is drift for a human to resolve.
+        missing_remote = [
+            {'server_id': s.id, 'external_id': s.external_id, 'name': s.name,
+             'origin': s.origin, 'status': s.status}
+            for s in local if s.external_id and s.external_id not in remote_ids
+        ]
+
+        return {
+            'provider_id': provider.id,
+            'provider_type': provider.provider_type,
+            'remote_total': len(remote),
+            'new': new,
+            'tracked': tracked,
+            'missing_remote': missing_remote,
+        }
+
     @staticmethod
     def get_provider_options(provider_type):
         return CloudProvisioningService.SUPPORTED_PROVIDERS.get(provider_type, {})
