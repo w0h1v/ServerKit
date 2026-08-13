@@ -44,6 +44,18 @@ class CloudProvisioningService:
             'sizes': ['g6-nanode-1', 'g6-standard-1', 'g6-standard-2', 'g6-standard-4', 'g6-standard-6'],
             'images': ['linode/ubuntu22.04', 'linode/ubuntu24.04', 'linode/debian12'],
         },
+        # Import-only. Hostinger's API manages VPSes you already own but does not
+        # create one — a new VPS is an ORDER (plan, term, payment), not an API call
+        # — so `create` refuses with an explanation instead of pretending. Discovery
+        # and adoption work exactly as they do for Vultr, which is what makes an
+        # existing Hostinger fleet visible here.
+        'hostinger': {
+            'name': 'Hostinger VPS',
+            'import_only': True,
+            'regions': [],
+            'sizes': [],
+            'images': [],
+        },
     }
 
     # --- Providers ---
@@ -84,11 +96,33 @@ class CloudProvisioningService:
     # Provider types whose remote inventory we can enumerate. Everything else
     # raises NotImplementedError rather than shipping three untested integrations,
     # and the UI hides the import affordance for them.
-    DISCOVERY_PROVIDERS = ('vultr',)
+    DISCOVERY_PROVIDERS = ('vultr', 'hostinger')
 
     @staticmethod
     def supports_discovery(provider_type):
         return provider_type in CloudProvisioningService.DISCOVERY_PROVIDERS
+
+    @staticmethod
+    def supports_provisioning(provider_type):
+        """False for a provider we can only import from (see 'import_only')."""
+        spec = CloudProvisioningService.SUPPORTED_PROVIDERS.get(provider_type) or {}
+        return not spec.get('import_only')
+
+    @staticmethod
+    def _hostinger_status(vm):
+        """Map a Hostinger VM's state onto CloudServer.STATUS_*.
+
+        Hostinger reports a lifecycle `state` (running/stopped/initial/...); a
+        stopped VPS still bills, so it is 'off' rather than absent.
+        """
+        state = str(vm.get('state') or vm.get('status') or '').lower()
+        if state in ('running', 'active'):
+            return CloudServer.STATUS_ACTIVE
+        if state in ('stopped', 'suspended', 'locked'):
+            return CloudServer.STATUS_OFF
+        if state in ('initial', 'creating', 'installing', 'restoring'):
+            return CloudServer.STATUS_CREATING
+        return CloudServer.STATUS_ERROR if state else CloudServer.STATUS_ACTIVE
 
     @staticmethod
     def _vultr_status(instance):
@@ -121,6 +155,8 @@ class CloudProvisioningService:
         """
         import requests
         ptype = provider.provider_type
+        if ptype == 'hostinger':
+            return CloudProvisioningService._hostinger_list_remote(provider)
         if ptype != 'vultr':
             raise NotImplementedError(
                 f'Listing remote servers is not implemented for {ptype}')
@@ -157,6 +193,51 @@ class CloudProvisioningService:
             cursor = (((body.get('meta') or {}).get('links') or {}).get('next') or '')
             if not cursor:
                 break
+        return out
+
+    HOSTINGER_API = 'https://developers.hostinger.com/api/vps/v1'
+
+    @staticmethod
+    def _hostinger_list_remote(provider):
+        """Hostinger's VPS inventory, normalised like the Vultr path.
+
+        Hostinger returns either a bare list or a ``{data: [...]}`` envelope
+        depending on the endpoint version, so accept both rather than trusting one
+        shape and breaking on the other.
+        """
+        import requests
+        resp = requests.get(
+            f'{CloudProvisioningService.HOSTINGER_API}/virtual-machines',
+            headers=CloudProvisioningService._auth_headers(provider), timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        items = body if isinstance(body, list) else (body.get('data') or [])
+
+        out = []
+        for vm in items:
+            ext = str(vm.get('id') or '')
+            label = (vm.get('hostname') or vm.get('name') or '').strip()
+            plan = vm.get('plan') or (vm.get('template') or {}).get('name')
+            # ipv4 comes back as a list of address objects on the v1 endpoint.
+            ipv4 = vm.get('ipv4')
+            if isinstance(ipv4, list):
+                ipv4 = next((a.get('address') for a in ipv4 if isinstance(a, dict)), None)
+            ipv6 = vm.get('ipv6')
+            if isinstance(ipv6, list):
+                ipv6 = next((a.get('address') for a in ipv6 if isinstance(a, dict)), None)
+            out.append({
+                'external_id': ext,
+                'name': label or f'hostinger-{ext[:8] or "vps"}',
+                'region': (vm.get('datacenter') or {}).get('city')
+                          if isinstance(vm.get('datacenter'), dict) else vm.get('region'),
+                'size': plan,
+                'image': ((vm.get('template') or {}).get('name')
+                          if isinstance(vm.get('template'), dict) else vm.get('os')),
+                'ip_address': ipv4 or None,
+                'ipv6_address': ipv6 or None,
+                'status': CloudProvisioningService._hostinger_status(vm),
+                'labelled': bool(label),
+            })
         return out
 
     @staticmethod
@@ -550,6 +631,17 @@ class CloudProvisioningService:
         """Call provider API to create server. Returns dict with id, ip_address, etc."""
         import requests
         ptype = provider.provider_type
+
+        # Import-only providers: refuse clearly instead of failing somewhere deeper
+        # with a shape error. Hostinger creates a VPS through an ORDER (plan, term,
+        # payment), which is not something we should drive from here.
+        if not CloudProvisioningService.supports_provisioning(ptype):
+            spec = CloudProvisioningService.SUPPORTED_PROVIDERS.get(ptype) or {}
+            raise ValueError(
+                f'{spec.get("name", ptype)} cannot create servers through the API — '
+                'order the VPS in their panel, then use Import existing to manage it here.'
+            )
+
         headers = CloudProvisioningService._auth_headers(provider)
 
         if ptype == 'digitalocean':

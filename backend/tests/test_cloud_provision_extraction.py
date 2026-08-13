@@ -643,3 +643,99 @@ def test_prefer_builtin_source_ignores_a_missing_source_tree(app):
     db.session.add(row)
     db.session.commit()
     assert plugin_service._prefer_builtin_source(row) is False
+
+
+# --------------------------------------------------------------------------- #
+# Hostinger: a VPS provider, so it belongs to the CloudProvider abstraction and
+# inherits discovery/adoption/destroy-guard rather than inventing its own shape.
+# Import-only on purpose — Hostinger creates a VPS through an ORDER (plan, term,
+# payment), which is not something to drive from an API call, so `create` refuses
+# with an explanation instead of failing somewhere deeper with a shape error.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def hostinger(app, install_dirs):
+    plugin_service.install_builtin_extension(SLUG)
+    from app.models.cloud_server import CloudProvider
+    provider = CloudProvider(name='Hostinger', provider_type='hostinger',
+                             api_key_encrypted='', is_active=True)
+    db.session.add(provider)
+    db.session.commit()
+    svc = importlib.import_module(f'{_PKG}.cloud_provisioning_service').CloudProvisioningService
+    return {'svc': svc, 'provider': provider}
+
+
+def test_hostinger_supports_discovery_but_not_provisioning(hostinger):
+    svc = hostinger['svc']
+    assert svc.supports_discovery('hostinger') is True
+    assert svc.supports_provisioning('hostinger') is False
+    assert svc.supports_provisioning('vultr') is True
+
+
+def test_hostinger_create_refuses_with_an_explanation(hostinger, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+    called = []
+    monkeypatch.setattr(requests, 'post', lambda *a, **k: called.append(a))
+
+    server = CloudServer(provider_id=hostinger['provider'].id, name='nope',
+                         status=CloudServer.STATUS_CREATING)
+    db.session.add(server)
+    db.session.commit()
+    with pytest.raises(ValueError, match='Import existing'):
+        hostinger['svc']._provider_create(hostinger['provider'], server, {})
+    assert called == [], 'must refuse before calling the provider'
+
+
+def test_hostinger_discovery_normalises_the_vps_list(hostinger, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp({'data': [
+        {'id': 991, 'hostname': 'build-box', 'state': 'running', 'plan': 'KVM 4',
+         'ipv4': [{'address': '203.0.113.7'}], 'ipv6': [{'address': '2001:db8::1'}],
+         'datacenter': {'city': 'Frankfurt'}, 'template': {'name': 'Ubuntu 24.04'}},
+        {'id': 992, 'hostname': '', 'state': 'stopped', 'plan': 'KVM 2',
+         'ipv4': [{'address': '203.0.113.8'}]},
+    ]}))
+
+    out = hostinger['svc']._provider_list_remote(hostinger['provider'])
+    assert [e['external_id'] for e in out] == ['991', '992']
+    first = out[0]
+    assert first['name'] == 'build-box'
+    assert first['ip_address'] == '203.0.113.7'
+    assert first['ipv6_address'] == '2001:db8::1'
+    assert first['region'] == 'Frankfurt'
+    assert first['image'] == 'Ubuntu 24.04'
+    assert first['status'] == CloudServer.STATUS_ACTIVE
+    # A stopped VPS still bills, so it is 'off' rather than dropped.
+    assert out[1]['status'] == CloudServer.STATUS_OFF
+    # Unlabelled hosts still need a name: the column is NOT NULL.
+    assert out[1]['name'] == 'hostinger-992'
+    assert out[1]['labelled'] is False
+
+
+def test_hostinger_accepts_a_bare_list_response(hostinger, monkeypatch):
+    """The v1 endpoint returns a bare list in some versions and {data:[…]} in
+    others; trusting one shape breaks on the other."""
+    import requests
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        [{'id': 5, 'hostname': 'bare', 'state': 'running'}]))
+    out = hostinger['svc']._provider_list_remote(hostinger['provider'])
+    assert [e['name'] for e in out] == ['bare']
+
+
+def test_hostinger_servers_adopt_and_cannot_be_destroyed(hostinger, monkeypatch):
+    import requests
+    from app.models.cloud_server import CloudServer
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: _GetResp(
+        {'data': [{'id': 77, 'hostname': 'legacy', 'state': 'running'}]}))
+
+    result = hostinger['svc'].sync_provider(hostinger['provider'].id)
+    assert len(result['adopted']) == 1
+
+    row = CloudServer.query.filter_by(external_id='77').first()
+    assert row.origin == CloudServer.ORIGIN_ADOPTED
+    svc_mod = importlib.import_module(f'{_PKG}.cloud_provisioning_service')
+    with pytest.raises(svc_mod.AdoptedServerError):
+        hostinger['svc'].destroy_server(row.id)
