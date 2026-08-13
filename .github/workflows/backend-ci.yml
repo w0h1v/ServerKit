@@ -66,6 +66,21 @@ jobs:
   pytest:
     name: pytest (${{ matrix.group }}/4)
     runs-on: ubuntu-latest
+    # Pin the hash seed so the suite is a reliable gate. Something in the suite (or
+    # in code it exercises) depends on set/dict iteration order, which Python
+    # randomises per process unless PYTHONHASHSEED is fixed. Symptom: roughly one
+    # or two of ~3130 tests fail per full run, a DIFFERENT one each time, while
+    # every one of them passes in isolation — so a red shard read as flaky and got
+    # re-run rather than investigated. Three consecutive unpinned runs failed on
+    # test_plugin_backups_sdk, then test_extension_migration + test_ingress_plane;
+    # pinned, the full suite is green.
+    #
+    # This is a MITIGATION, not the fix: it makes CI deterministic and keeps a real
+    # regression from hiding behind assumed flakiness. The actual bug is whatever
+    # reads unordered iteration as if it were stable, and it is still in there —
+    # finding it means bisecting with a seed that reproduces a failure.
+    env:
+      PYTHONHASHSEED: '0'
     strategy:
       # Report every failing shard in one pass instead of hiding shards 2-4
       # behind the first failure — one round of fixes instead of four.
