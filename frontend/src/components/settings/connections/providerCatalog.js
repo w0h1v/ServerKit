@@ -18,6 +18,11 @@ export const CONNECTION_CATEGORIES = [
     { key: 'email', label: 'Email & delivery', blurb: 'Outbound relays and deliverability for the mail server.' },
     { key: 'chat', label: 'Chat & webhooks', blurb: 'Send notifications to a shared chat room or webhook, filtered by category.' },
     { key: 'storage', label: 'Storage & backups', blurb: 'Off-site destinations for backups and large assets.' },
+    // App platforms are NOT infrastructure: there is no server to reach, nothing to
+    // install an agent on, and nothing here to provision. ServerKit reads their
+    // project inventory and never writes to them, so they get their own category
+    // rather than sitting beside cloud accounts and implying it can manage them.
+    { key: 'platform', label: 'App platforms', blurb: 'See projects, deployments and databases running on Railway, Vercel and Supabase. Read-only.' },
 ];
 
 export const CONNECTION_PROVIDERS = [
@@ -53,6 +58,14 @@ export const CONNECTION_PROVIDERS = [
         id: 'vultr', category: 'infra', name: 'Vultr', kind: 'cloud', providerType: 'vultr',
         blurb: 'Provision and manage Vultr instances.',
         docUrl: 'https://my.vultr.com/settings/#settingsapi', manageHref: '/servers',
+    },
+    {
+        id: 'hostinger', category: 'infra', name: 'Hostinger VPS', kind: 'cloud',
+        providerType: 'hostinger',
+        // Import-only: Hostinger's API manages VPSes you already own but cannot
+        // order a new one, so say that here rather than on a failed Create.
+        blurb: 'Import and manage VPSes you already own at Hostinger. Ordering a new VPS happens in their panel.',
+        docUrl: 'https://developers.hostinger.com/', manageHref: '/cloud',
     },
     {
         id: 'linode', category: 'infra', name: 'Linode', kind: 'cloud', providerType: 'linode',
@@ -112,6 +125,29 @@ export const CONNECTION_PROVIDERS = [
         // answered with a raw "Request failed (405)" — the SPA catch-all replying
         // to a route that does not exist — with nothing pointing at the real cause.
         requiresExtension: 'serverkit-email',
+    },
+
+    // ── App platforms ──
+    // Served by the App Platforms extension, so each is gated on it being installed
+    // — otherwise the card looks available and Save lands on a route that does not
+    // exist, which is exactly how the SMTP relay card used to fail.
+    {
+        id: 'vercel', category: 'platform', name: 'Vercel', kind: 'platform', platform: 'vercel',
+        blurb: 'List Vercel projects and their production deployments.',
+        docUrl: 'https://vercel.com/account/tokens', manageHref: '/platforms',
+        requiresExtension: 'serverkit-platforms',
+    },
+    {
+        id: 'railway', category: 'platform', name: 'Railway', kind: 'platform', platform: 'railway',
+        blurb: 'List Railway projects, environments and services.',
+        docUrl: 'https://railway.com/account/tokens', manageHref: '/platforms',
+        requiresExtension: 'serverkit-platforms',
+    },
+    {
+        id: 'supabase', category: 'platform', name: 'Supabase', kind: 'platform', platform: 'supabase',
+        blurb: 'List Supabase projects and their Postgres databases.',
+        docUrl: 'https://supabase.com/dashboard/account/tokens', manageHref: '/platforms',
+        requiresExtension: 'serverkit-platforms',
     },
 
     // ── Chat & webhooks ──

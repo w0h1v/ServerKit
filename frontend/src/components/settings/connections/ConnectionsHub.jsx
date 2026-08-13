@@ -44,11 +44,20 @@ export default function ConnectionsHub() {
     // A catalog entry whose API lives in an extension (`requiresExtension`) is
     // hidden until that extension is installed — otherwise the card looks
     // available and its Save lands on a route that does not exist.
-    const hasEmailExtension = useHasPlugin('serverkit-email');
+    //
+    // One hook per slug rather than a lookup: hooks cannot be called from a loop or
+    // a condition, so every gated extension has to be named here. Adding a
+    // `requiresExtension` to the catalog without adding it to this map would hide
+    // the card permanently, so keep the two in step.
+    const extensionAvailability = {
+        'serverkit-email': useHasPlugin('serverkit-email'),
+        'serverkit-platforms': useHasPlugin('serverkit-platforms'),
+    };
     const isProviderAvailable = useCallback((provider) => {
-        if (provider.requiresExtension === 'serverkit-email') return hasEmailExtension;
-        return !provider.requiresExtension;
-    }, [hasEmailExtension]);
+        if (!provider.requiresExtension) return true;
+        return extensionAvailability[provider.requiresExtension] ?? false;
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [extensionAvailability['serverkit-email'], extensionAvailability['serverkit-platforms']]);
 
     const [sourceStatus, setSourceStatus] = useState({ github: null, gitlab: null, bitbucket: null });
     const [sourceConfig, setSourceConfig] = useState({ github: null, gitlab: null, bitbucket: null });

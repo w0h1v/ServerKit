@@ -1,0 +1,38 @@
+{
+  "name": "serverkit-platforms",
+  "display_name": "App Platforms",
+  "version": "1.0.0",
+  "description": "Connect Railway, Vercel and Supabase, and see every project, deployment and database across them in one place. Read-only: ServerKit shows what these platforms run, it never changes or deletes it.",
+  "author": "ServerKit",
+  "license": "MIT",
+  "category": "integration",
+  "homepage": "https://github.com/jhd3197/ServerKit",
+  "permissions": ["network"],
+  "min_panel_version": "1.7.0",
+  "entry_point": "platforms:platforms_bp",
+  "url_prefix": "/api/v1/platforms",
+  "icon": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"7\" rx=\"2\"/><rect x=\"3\" y=\"14\" width=\"18\" height=\"6\" rx=\"2\"/><path d=\"M7 8h.01M7 17h.01\"/>",
+  "contributions": {
+    "tabs": [
+      {
+        "group": "servers",
+        "to": "/platforms",
+        "label": "App Platforms",
+        "order": 5,
+        "icon": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"7\" rx=\"2\"/><rect x=\"3\" y=\"14\" width=\"18\" height=\"6\" rx=\"2\"/><path d=\"M7 8h.01M7 17h.01\"/>"
+      }
+    ],
+    "routes": [
+      { "path": "platforms", "component": "PlatformsPage", "group": "servers" }
+    ],
+    "page_titles": { "/platforms": "App Platforms" },
+    "command_palette": [
+      {
+        "label": "App Platforms",
+        "path": "/platforms",
+        "category": "Pages",
+        "keywords": "railway vercel supabase paas projects deployments"
+      }
+    ]
+  }
+}

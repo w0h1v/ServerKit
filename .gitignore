@@ -195,6 +195,7 @@ backend/app/plugins/serverkit-gui/
 backend/app/plugins/serverkit-k8s/
 backend/app/plugins/serverkit-mail/
 backend/app/plugins/serverkit-remote-access/
+backend/app/plugins/serverkit-platforms/
 backend/app/plugins/serverkit-status/
 backend/app/plugins/serverkit-tramo/
 backend/app/plugins/serverkit-wordpress/
@@ -206,6 +207,7 @@ frontend/src/plugins/serverkit-gpu/
 frontend/src/plugins/serverkit-gui/
 frontend/src/plugins/serverkit-k8s/
 frontend/src/plugins/serverkit-mail/
+frontend/src/plugins/serverkit-platforms/
 frontend/src/plugins/serverkit-tramo/
 frontend/src/plugins/serverkit-wordpress/
 /graphify-out

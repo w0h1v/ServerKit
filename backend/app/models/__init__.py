@@ -30,6 +30,7 @@ from app.models.email import EmailDomain, EmailAccount, EmailAlias, EmailForward
 from app.models.oauth_identity import OAuthIdentity
 from app.models.source_connection import SourceConnection
 from app.models.registrar_connection import RegistrarConnection
+from app.models.platform_connection import PlatformConnection
 from app.models.container_registry import ContainerRegistry
 from app.models.app_volume import AppVolume
 from app.models.application_manifest import ApplicationManifest
@@ -91,7 +92,7 @@ __all__ = [
     'WordPressCustomPlugin', 'WordPressSitePlugin',
     'EnvironmentActivity', 'PromotionJob', 'SanitizationProfile',
     'EmailDomain', 'EmailAccount', 'EmailAlias', 'EmailForwardingRule', 'DNSProviderConfig', 'EmailRelayConfig',
-    'OAuthIdentity', 'SourceConnection', 'RegistrarConnection', 'ContainerRegistry', 'AppVolume', 'ManagedDatabase', 'ApiKey', 'ApiUsageLog', 'ApiUsageSummary',
+    'OAuthIdentity', 'SourceConnection', 'RegistrarConnection', 'PlatformConnection', 'ContainerRegistry', 'AppVolume', 'ManagedDatabase', 'ApiKey', 'ApiUsageLog', 'ApiUsageSummary',
     'EventSubscription', 'EventDelivery', 'Invitation',
     'ServerAlertThreshold', 'MetricAlert',
     'AgentPlugin', 'AgentPluginInstall',

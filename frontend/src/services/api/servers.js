@@ -1063,3 +1063,36 @@ export async function linkPanel(data) {
 export async function unlinkPanel() {
     return this.request('/linked-panel', { method: 'DELETE' });
 }
+
+// ── App Platforms (Railway / Vercel / Supabase) ───────────────────────────────
+// Read-only over the platforms themselves; the only writes are to our own
+// connection rows. Inventory is live per call — nothing is mirrored locally.
+export async function getPlatformCatalog() {
+    return this.request('/platforms/catalog');
+}
+
+export async function getPlatformConnections() {
+    return this.request('/platforms/connections');
+}
+
+export async function createPlatformConnection(data) {
+    return this.request('/platforms/connections', { method: 'POST', body: data });
+}
+
+export async function verifyPlatformConnection(id) {
+    return this.request(`/platforms/connections/${id}/verify`, { method: 'POST' });
+}
+
+export async function deletePlatformConnection(id) {
+    return this.request(`/platforms/connections/${id}`, { method: 'DELETE' });
+}
+
+export async function getPlatformInventory(platform) {
+    const query = platform ? `?platform=${encodeURIComponent(platform)}` : '';
+    return this.request(`/platforms/inventory${query}`);
+}
+
+export async function getPlatformProjectResources(connectionId, projectRef) {
+    return this.request(
+        `/platforms/connections/${connectionId}/projects/${encodeURIComponent(projectRef)}/resources`);
+}
