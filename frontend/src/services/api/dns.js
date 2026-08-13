@@ -34,6 +34,36 @@ export async function getProviderRecords(configId, providerZoneId) {
     return this.request(`/dns/provider-records?${params.toString()}`);
 }
 
+// Create or update one record in a live provider zone. Pass provider_record_id to
+// edit in place. A record ServerKit did not create comes back 409 with
+// requires_confirmation, so the caller can re-send with allow_foreign rather than
+// silently overwriting someone's hand-written record.
+export async function writeProviderRecord(configId, providerZoneId, record, options = {}) {
+    return this.request('/dns/provider-records', {
+        method: 'PUT',
+        body: {
+            config_id: configId,
+            zone: providerZoneId,
+            ...record,
+            ...(options.allowForeign ? { allow_foreign: true } : {}),
+        },
+    });
+}
+
+// Delete one record from a live provider zone. Also 409s with
+// requires_confirmation for a record ServerKit did not create.
+export async function deleteProviderRecord(configId, providerZoneId, providerRecordId, options = {}) {
+    return this.request('/dns/provider-records', {
+        method: 'DELETE',
+        body: {
+            config_id: configId,
+            zone: providerZoneId,
+            provider_record_id: providerRecordId,
+            ...(options.allowForeign ? { allow_foreign: true } : {}),
+        },
+    });
+}
+
 // Registration expiry / registrar via RDAP (WHOIS successor) — lazy fallback when
 // no connected provider has the data. One domain per call.
 export async function getDomainRegistration(domain) {

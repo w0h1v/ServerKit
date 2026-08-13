@@ -145,15 +145,28 @@ class DnsOwnershipService:
 
     @staticmethod
     def guarded_delete(client, *, provider_zone_id, record_type, name, provider_record_id=None,
-                       provider='cloudflare', source=None, config_id=None):
-        """Delete only a record ServerKit owns; never a foreign one. Clears our
-        ledger entry and logs the change on success."""
+                       provider='cloudflare', source=None, config_id=None,
+                       allow_foreign=False):
+        """Delete a record ServerKit owns; a foreign one only with ``allow_foreign``.
+
+        The default protects AUTOMATION: a deploy tearing down its own records must
+        never take out a record the operator wrote by hand. ``allow_foreign=True`` is
+        for the opposite case — a human looking at this exact record in their own
+        zone and asking for it to go — and mirrors ``guarded_upsert``'s flag of the
+        same name. Callers that pass nothing keep the old behaviour exactly.
+
+        Clears our ledger entry and logs the change on success.
+        """
         from app.services.dns_change_service import DnsChangeService
         if provider_record_id:
             owned = DnsOwnershipService.owns(provider_zone_id, provider_record_id=provider_record_id)
         else:
             owned = DnsOwnershipService.owns(provider_zone_id, record_type=record_type, name=name)
-        if not owned:
+        if not owned and not allow_foreign:
+            # success=True is kept for the automation callers that rely on it: from
+            # their side "there is no record of ours here" is a satisfied
+            # postcondition, not a failure. `skipped` is how an interactive caller
+            # tells the difference — an endpoint must not report this as a delete.
             return {'success': True, 'skipped': True,
                     'message': 'No ServerKit-owned record to delete.'}
         res = client.delete(provider_zone_id, record_id=provider_record_id,

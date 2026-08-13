@@ -7,7 +7,7 @@
 // out to the Cloudflare ops surface.
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, RefreshCw, Cloud, ShieldCheck, Radio, Download, Activity } from 'lucide-react';
+import { Plus, RefreshCw, Cloud, ShieldCheck, Radio, Download, Activity, Pencil, Trash2 } from 'lucide-react';
 import api from '../../services/api';
 import { useToast } from '../../contexts/ToastContext';
 import { ProviderBrandIcon } from '../icons/ProviderBrands';
@@ -54,6 +54,10 @@ export default function DomainDnsPanel({ domain, isAdmin }) {
     const [hosts, setHosts] = useState([]);
     const [revealedHost, setRevealedHost] = useState(null);
     const [busyKey, setBusyKey] = useState(null);
+    const [editing, setEditing] = useState(null);
+    // Set when the provider write came back 409: the record was not created by
+    // ServerKit, so the operator confirms taking it over rather than us deciding.
+    const [confirmForeign, setConfirmForeign] = useState(null);
 
     // Power tools (moved from the retired DNS Zones page).
     const [exporting, setExporting] = useState(false);
@@ -149,6 +153,79 @@ export default function DomainDnsPanel({ domain, isAdmin }) {
             toast.error(e.message || 'Failed to add record');
         } finally {
             setSaving(false);
+        }
+    }
+
+    // ── Edit / delete a record that lives in the provider zone ────────────────
+    // Until now this panel could list every record and change none of them: adding
+    // went through the local-zone path, and editing an existing record had no route
+    // at all. These call the provider write path directly, addressed by the
+    // provider's own record id.
+    //
+    // A record ServerKit did not create comes back 409 with requires_confirmation
+    // rather than being overwritten silently. The operator is looking at their own
+    // zone, so taking it over is a fair thing to offer — but only once they say so.
+    function startEdit(r) {
+        setEditing({
+            provider_record_id: r.id,
+            record_type: r.type,
+            name: r.name,
+            content: r.content,
+            ttl: r.ttl === 1 ? 1 : (r.ttl || 3600),
+            priority: r.priority ?? '',
+            proxied: !!r.proxied,
+            was_external: r.source !== 'serverkit',
+        });
+    }
+
+    async function saveEdit({ allowForeign = false } = {}) {
+        if (!editing) return;
+        setSaving(true);
+        try {
+            const payload = {
+                provider_record_id: editing.provider_record_id,
+                record_type: editing.record_type,
+                name: editing.name,
+                content: editing.content,
+                ttl: Number(editing.ttl) || 3600,
+                priority: editing.priority === '' ? null : Number(editing.priority),
+                proxied: isCloudflare && PROXYABLE.includes(editing.record_type)
+                    ? !!editing.proxied : false,
+            };
+            await api.writeProviderRecord(domain.config_id, domain.provider_zone_id,
+                                         payload, { allowForeign });
+            toast.success('Record updated');
+            setEditing(null);
+            setConfirmForeign(null);
+            await load();
+        } catch (e) {
+            if (e.status === 409 || /not created by ServerKit|already exists/i.test(e.message || '')) {
+                setConfirmForeign({ kind: 'edit', label: `${editing.record_type} ${editing.name}` });
+            } else {
+                toast.error(e.message || 'Failed to update record');
+            }
+        } finally {
+            setSaving(false);
+        }
+    }
+
+    async function deleteRecord(r, { allowForeign = false } = {}) {
+        setBusyKey(r.id);
+        try {
+            await api.deleteProviderRecord(domain.config_id, domain.provider_zone_id,
+                                          r.id, { allowForeign });
+            toast.success('Record deleted');
+            setConfirmForeign(null);
+            await load();
+        } catch (e) {
+            if (e.status === 409 || /not created by ServerKit/i.test(e.message || '')) {
+                setConfirmForeign({ kind: 'delete', record: r,
+                                    label: `${r.type} ${r.name}` });
+            } else {
+                toast.error(e.message || 'Failed to delete record');
+            }
+        } finally {
+            setBusyKey(null);
         }
     }
 
@@ -387,6 +464,25 @@ export default function DomainDnsPanel({ domain, isAdmin }) {
                                                             </Button>
                                                         )
                                                     )}
+                                                    {/* Edit/Delete address the record by the PROVIDER's record id, so
+                                                        they work on any record in the zone — not just ones ServerKit
+                                                        created. Taking over a record it did not create still needs an
+                                                        explicit confirmation. */}
+                                                    {isAdmin && canLive && r.id && (
+                                                        <>
+                                                            <Button variant="ghost" size="sm" className="ddp__iconbtn"
+                                                                    title="Edit this record"
+                                                                    onClick={() => startEdit(r)}>
+                                                                <Pencil size={13} />
+                                                            </Button>
+                                                            <Button variant="ghost" size="sm" className="ddp__stopbtn"
+                                                                    title="Delete this record"
+                                                                    disabled={busyKey === r.id}
+                                                                    onClick={() => deleteRecord(r)}>
+                                                                <Trash2 size={13} />
+                                                            </Button>
+                                                        </>
+                                                    )}
                                                 </td>
                                             )}
                                         </tr>
@@ -413,6 +509,81 @@ export default function DomainDnsPanel({ domain, isAdmin }) {
                     ) : (
                         <p className="ddp__msg">No propagation data.</p>
                     ))}
+                </div>
+            )}
+
+            {editing && isAdmin && (
+                <div className="ddp__edit">
+                    <h4>Edit {editing.record_type} {editing.name}</h4>
+                    {editing.was_external && (
+                        // Say this before the save, not after the 409 — the operator
+                        // should know they are taking over a record they wrote by hand.
+                        <p className="ddp__msg">
+                            This record was not created by ServerKit. Saving will take over
+                            managing it.
+                        </p>
+                    )}
+                    <div className="ddp__editgrid">
+                        <label>Name
+                            <Input value={editing.name}
+                                   onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
+                        </label>
+                        <label>Content
+                            <Input value={editing.content}
+                                   onChange={(e) => setEditing({ ...editing, content: e.target.value })} />
+                        </label>
+                        <label>TTL
+                            <Input value={editing.ttl}
+                                   onChange={(e) => setEditing({ ...editing, ttl: e.target.value })} />
+                        </label>
+                        {['MX', 'SRV'].includes(editing.record_type) && (
+                            <label>Priority
+                                <Input value={editing.priority}
+                                       onChange={(e) => setEditing({ ...editing, priority: e.target.value })} />
+                            </label>
+                        )}
+                        {isCloudflare && PROXYABLE.includes(editing.record_type) && (
+                            <label className="ddp__check">
+                                <input type="checkbox" checked={!!editing.proxied}
+                                       onChange={(e) => setEditing({ ...editing, proxied: e.target.checked })} />
+                                Proxied
+                            </label>
+                        )}
+                    </div>
+                    <div className="ddp__editact">
+                        <Button variant="outline" size="sm" onClick={() => setEditing(null)}>Cancel</Button>
+                        <Button size="sm" disabled={saving || !editing.content}
+                                onClick={() => saveEdit({ allowForeign: editing.was_external })}>
+                            {saving ? 'Saving…' : 'Save record'}
+                        </Button>
+                    </div>
+                </div>
+            )}
+
+            {confirmForeign && (
+                <div className="ddp__edit">
+                    <h4>
+                        {confirmForeign.kind === 'delete' ? 'Delete' : 'Take over'}{' '}
+                        {confirmForeign.label}?
+                    </h4>
+                    <p className="ddp__msg">
+                        ServerKit did not create this record, so it stopped rather than
+                        change something you may rely on.{' '}
+                        {confirmForeign.kind === 'delete'
+                            ? 'Deleting it affects live DNS immediately.'
+                            : 'Saving will overwrite it and start managing it here.'}
+                    </p>
+                    <div className="ddp__editact">
+                        <Button variant="outline" size="sm" onClick={() => setConfirmForeign(null)}>
+                            Leave it alone
+                        </Button>
+                        <Button variant="destructive" size="sm"
+                                onClick={() => (confirmForeign.kind === 'delete'
+                                    ? deleteRecord(confirmForeign.record, { allowForeign: true })
+                                    : saveEdit({ allowForeign: true }))}>
+                            {confirmForeign.kind === 'delete' ? 'Delete anyway' : 'Overwrite it'}
+                        </Button>
+                    </div>
                 </div>
             )}
 

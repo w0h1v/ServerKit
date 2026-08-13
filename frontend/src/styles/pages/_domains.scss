@@ -253,8 +253,55 @@
         border-top: 1px solid $border-subtle;
     }
 
-    // Per-record actions column — "Make dynamic" / Dynamic-host controls.
-    &__c-act { width: 168px; text-align: right; }
+    // Inline edit form and the take-over confirmation. Both sit in the panel flow
+    // rather than a modal: the record list stays visible, so the operator can see
+    // what else is in the zone while changing one row of it.
+    &__edit {
+        display: flex;
+        flex-direction: column;
+        gap: $space-2;
+        padding: $space-3;
+        border: 1px solid $border-subtle;
+        border-radius: $radius-sm;
+        background: $bg-elevated;
+
+        h4 {
+            margin: 0;
+            font-size: $font-size-sm;
+            font-weight: $font-weight-semibold;
+        }
+    }
+
+    &__editgrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+        gap: $space-2;
+
+        label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-size: $font-size-xs;
+            color: $text-secondary;
+        }
+    }
+
+    &__check {
+        flex-direction: row !important;
+        align-items: center;
+        gap: $space-1;
+        align-self: end;
+    }
+
+    &__editact {
+        display: flex;
+        justify-content: flex-end;
+        gap: $space-2;
+    }
+
+    // Per-record actions column — "Make dynamic" / Dynamic-host controls, plus the
+    // edit/delete buttons, so it needs more room than the dynamic controls alone.
+    &__c-act { width: 232px; text-align: right; }
 
     &__dynwrap {
         display: inline-flex;

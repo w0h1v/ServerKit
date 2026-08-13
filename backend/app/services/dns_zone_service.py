@@ -305,6 +305,87 @@ class DNSZoneService:
         }
 
     @staticmethod
+    def _provider_client_by_ref(config_id):
+        """(client, provider) for a connected DNS config, or (None, error string)."""
+        from app.models.email import DNSProviderConfig
+        config = DNSProviderConfig.query.get(int(config_id)) if config_id else None
+        if not config:
+            return None, 'Connection not found'
+        if config.provider != 'cloudflare':
+            return None, 'Editing live records is only available for Cloudflare'
+        from app.services.dns import CloudflareClient
+        from app.services.dns.base import DnsCredential
+        return CloudflareClient(DnsCredential.from_provider_config(config)), None
+
+    @staticmethod
+    def write_provider_record(config_id, provider_zone_id, spec_data, *,
+                              provider_record_id=None, allow_foreign=False,
+                              source='manual'):
+        """Create or update ONE record in a live provider zone.
+
+        This is the write half of ``list_provider_records_by_ref`` — the drawer could
+        show every record in a zone but change none of them, so DNS was effectively
+        read-plus-append: createDNSRecord went through the local-zone path while
+        editing an existing record had no route at all.
+
+        Ownership still decides what happens without an explicit instruction:
+        ``allow_foreign`` false keeps the automation guarantee (never silently
+        overwrite a record a human wrote), true is the operator saying "yes, that
+        record, change it". Either way the write is recorded in the ownership ledger
+        and the change log, so a record ServerKit edits becomes one it tracks.
+        """
+        from app.services.dns.base import DnsRecordSpec
+        from app.services.dns_ownership_service import DnsOwnershipService
+
+        client, error = DNSZoneService._provider_client_by_ref(config_id)
+        if error:
+            return {'success': False, 'error': error}
+        if not provider_zone_id:
+            return {'success': False, 'error': 'No provider zone id for this domain'}
+
+        record_type = (spec_data.get('record_type') or spec_data.get('type') or '').upper()
+        name = (spec_data.get('name') or '').strip()
+        content = (spec_data.get('content') or '').strip()
+        if not record_type or not name or not content:
+            return {'success': False, 'error': 'record_type, name and content are required'}
+
+        spec = DnsRecordSpec(
+            record_type=record_type,
+            name=name,
+            content=content,
+            ttl=int(spec_data.get('ttl') or 3600),
+            priority=(int(spec_data['priority'])
+                      if spec_data.get('priority') not in (None, '') else None),
+            proxied=bool(spec_data.get('proxied')),
+        )
+        return DnsOwnershipService.guarded_upsert(
+            client, provider='cloudflare', provider_zone_id=provider_zone_id, spec=spec,
+            source=source, config_id=int(config_id), known_record_id=provider_record_id,
+            allow_foreign=allow_foreign)
+
+    @staticmethod
+    def delete_provider_record(config_id, provider_zone_id, *, provider_record_id=None,
+                               record_type=None, name=None, allow_foreign=False,
+                               source='manual'):
+        """Delete ONE record from a live provider zone."""
+        from app.services.dns_ownership_service import DnsOwnershipService
+
+        client, error = DNSZoneService._provider_client_by_ref(config_id)
+        if error:
+            return {'success': False, 'error': error}
+        if not provider_zone_id:
+            return {'success': False, 'error': 'No provider zone id for this domain'}
+        if not provider_record_id and not (record_type and name):
+            return {'success': False,
+                    'error': 'provider_record_id, or record_type and name, are required'}
+
+        return DnsOwnershipService.guarded_delete(
+            client, provider_zone_id=provider_zone_id,
+            record_type=(record_type or '').upper() or None, name=name,
+            provider_record_id=provider_record_id, provider='cloudflare',
+            source=source, config_id=int(config_id), allow_foreign=allow_foreign)
+
+    @staticmethod
     def list_provider_records_by_ref(config_id, provider_zone_id):
         """Live records for a Cloudflare zone addressed directly by connection +
         provider zone id — so the Domains drawer can show a domain's real DNS without

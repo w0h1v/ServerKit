@@ -63,6 +63,75 @@ def provider_records():
     return jsonify(DNSZoneService.list_provider_records_by_ref(config_id, zone))
 
 
+@dns_zones_bp.route('/provider-records', methods=['POST', 'PUT'])
+@jwt_required()
+def write_provider_record():
+    """Create or update one record in a live provider zone.
+
+    The write half of GET /provider-records. Without it the Domains drawer could
+    list every record in a zone and change none of them, so DNS was read-plus-append:
+    adding went through the local-zone path, editing an existing record had no route.
+
+    Body: config_id, zone (provider zone id), record_type, name, content, ttl?,
+    priority?, proxied?, provider_record_id? (update in place),
+    allow_foreign? (explicitly manage a record ServerKit did not create).
+    """
+    user = get_current_user()
+    if not user or not user.is_admin:
+        return jsonify({'error': 'Admin access required'}), 403
+    data = request.get_json() or {}
+    result = DNSZoneService.write_provider_record(
+        data.get('config_id'), data.get('zone'), data,
+        provider_record_id=data.get('provider_record_id'),
+        allow_foreign=bool(data.get('allow_foreign')),
+    )
+    if result.get('conflict'):
+        # A record we do not own is in the way and the caller did not say to take it
+        # over. 409 with the reason, so the UI can offer that choice instead of
+        # reporting a save that silently did nothing.
+        return jsonify({**result, 'requires_confirmation': True}), 409
+    if not result.get('success'):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@dns_zones_bp.route('/provider-records', methods=['DELETE'])
+@jwt_required()
+def delete_provider_record():
+    """Delete one record from a live provider zone.
+
+    Query/body: config_id, zone, provider_record_id (or record_type + name),
+    allow_foreign? to remove a record ServerKit did not create.
+    """
+    user = get_current_user()
+    if not user or not user.is_admin:
+        return jsonify({'error': 'Admin access required'}), 403
+    data = request.get_json(silent=True) or {}
+    args = request.args
+
+    def field(key):
+        return data.get(key) if data.get(key) is not None else args.get(key)
+
+    allow_foreign = str(field('allow_foreign') or '').lower() in ('1', 'true', 'yes')
+    result = DNSZoneService.delete_provider_record(
+        field('config_id'), field('zone'),
+        provider_record_id=field('provider_record_id'),
+        record_type=field('record_type'), name=field('name'),
+        allow_foreign=allow_foreign,
+    )
+    if result.get('skipped'):
+        # guarded_delete returns success=True here because for automation "no record
+        # of ours" is a satisfied postcondition. For a human who clicked Delete on a
+        # specific row it is not — reporting success would claim a deletion that
+        # never happened.
+        return jsonify({**result, 'success': False, 'requires_confirmation': True,
+                        'error': 'That record was not created by ServerKit. '
+                                 'Confirm to delete it anyway.'}), 409
+    if not result.get('success'):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
 @dns_zones_bp.route('/<int:zone_id>', methods=['GET'])
 @jwt_required()
 def get_zone(zone_id):
